@@ -7,7 +7,7 @@
 //    10 per number and 30 per IP per hour, across every app.
 //  - Every limit is the same whether or not the number is known (no enumeration).
 import { randomInt, randomUUID } from "node:crypto";
-import { BlooioClient, resolveSenderLine, type BlooioClientOptions } from "@thenetwork/blooio";
+import { BlooioClient, ChannelSendError, resolveSenderLine, type BlooioClientOptions } from "@thenetwork/blooio";
 import { DAY, HOUR } from "../../core/src/clock.ts";
 import type { AppId, AppInfo } from "./apps.ts";
 import { devShortcutsAllowed, type Env } from "./env.ts";
@@ -96,9 +96,11 @@ export class BlooioOtpProvider implements OtpProvider {
       const receipt = await this.client.send({ from: this.from, to: e164, text: `${app.name} verification code: ${code}. Expires in 10 minutes. Do not share this code.`, idempotencyKey: `otp:${randomUUID()}` });
       if (receipt.status === "failed") throw new Error("rejected");
       return { code, ref: receipt.providerMessageId, chatId: receipt.chatId };
-    } catch {
-      // Provider errors can echo the request. Never pass them to the ordinary OTP log.
-      throw new Error("Blooio OTP send was not confirmed; no fallback was attempted");
+    } catch (error) {
+      // Provider errors can echo the code, recipient or key. Retain only bounded metadata.
+      const failure = error instanceof ChannelSendError && ["retryable", "await_recipient", "blocked", "invalid", "auth", "unknown"].includes(error.failure) ? error.failure : "unknown";
+      const status = error instanceof ChannelSendError && typeof error.status === "number" && Number.isInteger(error.status) && error.status >= 100 && error.status <= 599 ? error.status : "none";
+      throw new Error(`Blooio OTP send was not confirmed; no fallback was attempted (failure=${failure}, http=${status})`);
     }
   }
 }

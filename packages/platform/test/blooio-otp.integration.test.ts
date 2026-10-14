@@ -134,10 +134,12 @@ describe.skipIf(!pgAvailable)("Blooio OTP via local HTTP and Postgres", () => {
 
   test("rejected, malformed and uncertain sends never create a usable challenge or try another provider", async () => {
     for (mode of ["reject", "failed", "missing-id", "missing-status", "unknown", "timeout"]) {
-      const p = phone(), count = requests.length;
+      const p = phone(), count = requests.length, logCount = logs.length;
       expect(await service(provider()).start(APPS.peon, p, p)).toEqual({ ok: true });
       expect(requests.length).toBe(count + 1);
       expect(await store.latestChallenge("peon", p)).toBeUndefined();
+      const diagnostic = mode === "reject" ? "failure=blocked, http=403" : mode === "failed" ? "failure=unknown, http=none" : mode === "timeout" ? "failure=retryable, http=none" : mode === "missing-id" ? "failure=retryable, http=200" : "failure=retryable, http=201";
+      expect(logs.slice(logCount)).toEqual([`[otp] send failed for peon: Blooio OTP send was not confirmed; no fallback was attempted (${diagnostic})`]);
       for (const secret of [requests.at(-1)!.code, p, "synthetic-key"]) expect(logs.join("\n")).not.toContain(secret);
     }
   });
