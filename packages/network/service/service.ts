@@ -1884,7 +1884,9 @@ export class NetworkService implements RuntimeHost {
         if (!claim || claim.status !== "done" || claim.response?.outcome !== "handled") return json({error: "turn_unavailable", retryable: false}, 409);
         if (this.routePolicy && !routeEnvelopeAllowed(this.routePolicy, claim.network_authority, this.clock.now()))
           return json({error:"route_authority_invalid",retryable:false},403);
-        if (claim.receipt_hash === digest) return json({ok: true, replayed: true});
+        // Cloud and Gateway independently acknowledge the same acceptance. JSON
+        // object key order may differ; the authenticated receipt values may not.
+        if (claim.receipt_hash === digest || (claim.receipt_hash && isDeepStrictEqual(claim.receipt, b))) return json({ok: true, replayed: true});
         if (claim.receipt_hash && !(claim.receipt?.outcome === "unknown" && ["accepted", "rejected"].includes(b.outcome as string))) return json({error: "receipt_conflict", retryable: false}, 409);
         const collected = claim.replies as CollectedReply[];
         // A handled turn with no reply (a quiet acknowledgement, an under-13 decline) takes an empty receipt and is done.

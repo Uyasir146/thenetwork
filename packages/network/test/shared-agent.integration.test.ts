@@ -3,7 +3,7 @@ import {afterAll, beforeAll, expect, test} from "bun:test";
 import {randomUUID} from "node:crypto";
 import {SQL} from "bun";
 import {SimClock, MINUTE, DAY} from "@thenetwork/core";
-import {applySchema} from "../../observatory/db/dev-pg.ts";
+import {applySchema, DEV_PG_PORT} from "../../observatory/db/dev-pg.ts";
 import {APPS} from "../../platform/src/apps.ts";
 import {svcSign} from "../../core/src/svc/svc-auth.ts";
 import {TURN_PATH, TURN_RECEIPT_PATH, type TurnRequest, type TurnReceiptRequest} from "../../core/src/svc/contract.ts";
@@ -12,8 +12,8 @@ import {NetworkService} from "../service/service.ts";
 import {networkRoutePolicy, routeEnvelopeAllowed} from "../service/route-authority.ts";
 
 const db = `network_signed_turn_${randomUUID().replaceAll("-", "")}`;
-const admin = new SQL({url:`postgres://${process.env.USER ?? "postgres"}@127.0.0.1:54339/postgres`, max:1});
-const url = `postgres://${process.env.USER ?? "postgres"}@127.0.0.1:54339/${db}`;
+const admin = new SQL({url:`postgres://${process.env.USER ?? "postgres"}@127.0.0.1:${DEV_PG_PORT}/postgres`, max:1});
+const url = `postgres://${process.env.USER ?? "postgres"}@127.0.0.1:${DEV_PG_PORT}/${db}`;
 const secret = "synthetic-shared-agent-test-secret-20261009";
 const clock = new SimClock(Date.UTC(2026, 9, 9, 16));
 let sql: SQL, service: NetworkService, server: ReturnType<typeof Bun.serve>;
@@ -302,7 +302,26 @@ test("isolated route authority fences cross-realm writes and only drains exact d
   expect((await post({...input,text:"STOP"})).status).toBe(409);
   expect((await post({...input,messageId:"isolated-new-after-close"})).status).toBe(403);
   const ack = {channel:input.channel,messageId:input.messageId,replyIds:response.replyIds,outcome:"accepted" as const,providerMessageIds:["synthetic-isolated-receipt"],historyRecorded:false,networkAuthority:authority};
+  const escapedBeforeReceipt = escaped;
   expect((await receipt(ack)).status).toBe(200);
+  const [savedReceipt] = await sql`select receipt_hash,receipt from platform.inbound where id='msg:blooio:isolated-help'`;
+  // Cloud appends the bound authority; Gateway places it after channel. Both
+  // sign their own raw bytes, while the previously accepted receipt stays put.
+  const gatewayAck = {channel:ack.channel,networkAuthority:{realmId:authority.realmId,audience:authority.audience,generation:authority.generation,routeId:authority.routeId,version:authority.version},messageId:ack.messageId,replyIds:ack.replyIds,outcome:ack.outcome,providerMessageIds:ack.providerMessageIds,historyRecorded:ack.historyRecorded};
+  expect(JSON.stringify(gatewayAck)).not.toBe(JSON.stringify(ack));
+  expect(await (await receipt(gatewayAck)).json()).toEqual({ok:true,replayed:true});
+  expect((await sql`select receipt_hash,receipt from platform.inbound where id='msg:blooio:isolated-help'`)[0]).toEqual(savedReceipt);
+  expect(savedReceipt.receipt_hash).toBe(new Bun.CryptoHasher("sha256").update(JSON.stringify(ack)).digest("hex"));
+  for (const changed of [
+    {...gatewayAck,providerMessageIds:["different-provider-receipt"]},
+    {...gatewayAck,historyRecorded:true},
+    {...gatewayAck,replyIds:[...gatewayAck.replyIds].reverse().concat("different-reply")},
+  ]) expect((await receipt(changed)).status).toBe(409);
+  expect((await receipt({...gatewayAck,extra:true} as TurnReceiptRequest)).status).toBe(400);
+  const signedBody = JSON.stringify(ack), reorderedBody = JSON.stringify(gatewayAck);
+  const wrongSignature = await svcSign(secret,{method:"POST",path:TURN_RECEIPT_PATH,id:`${input.messageId}:receipt`,body:signedBody,nowS:Math.floor(clock.now()/1000)});
+  expect((await fetch(new URL(TURN_RECEIPT_PATH,server.url),{method:"POST",headers:{"content-type":"application/json",...wrongSignature},body:reorderedBody})).status).toBe(401);
+  expect(escaped).toBe(escapedBeforeReceipt);
   expect((await receipt({...ack,networkAuthority:{...authority,realmId:"wrong"}})).status).toBe(403);
   const raw = JSON.stringify({channel:input.channel,messageId:input.messageId,app:"friends",memberId:"none",itemId:null,text:"tell them hi",networkAuthority:authority});
   const relay = await fetch(new URL("/internal/relay",server.url),{method:"POST",headers:{"content-type":"application/json",...await svcSign(secret,{method:"POST",path:"/internal/relay",id:`${input.messageId}:relay`,body:raw,nowS:Math.floor(clock.now()/1000)})},body:raw});
