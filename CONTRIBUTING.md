@@ -174,7 +174,7 @@ Real LLM calls are required for evidence. Mocked LLM output is not proof. Set `S
 | The relay scam classifier on Clef (Workers AI) | `bun run relay-eval --live --budget-usd 1` |
 | Clef photo features (consented photos only) | `bun run clef features --photos <dir> --manifest consent.jsonl --out features.jsonl --budget-usd 5 --live` |
 
-Note: no checked-in command runs the engine's LLM judge passes today. The service and the sim adapter (`packages/sim/src/engineAdapter.ts`) do not wire `engineLLM`, so the run log reports the judge as off. If your change touches `judge*.ts`, agree the measurement method with a maintainer in the issue before you start.
+The service's engine judge is off by default. For a bounded real-model qualification, use `NETWORK_ENGINE_JUDGE=1` with the budget, request limit and dry-run command in [the service README](packages/network/service/README.md#matching-judge-in-staging). This does not enable matching, approve proposals or enable sends. The sim adapter (`packages/sim/src/engineAdapter.ts`) still does not supply an LLM to the engine. If your change touches `judge*.ts`, agree the measurement method with a maintainer in the issue before you start.
 
 In the PR, give the provider, the exact model ID, the request settings, the number of calls and the cost.
 
