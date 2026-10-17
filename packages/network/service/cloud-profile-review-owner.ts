@@ -1,8 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readCapped } from "../../platform/src/body.ts";
 import { isAppId } from "../../platform/src/apps.ts";
 import { PROFILE_REVIEW_OWNER_PATH as OWNER_PATH, parseProfileReviewOwnerRequest, parseProfileReviewOwnerProof } from "../../core/src/svc/profile-review-owner.ts";
-import { svcSign, svcVerify } from "../../core/src/svc/svc-auth.ts";
+import { profileReviewProofTransport } from "./profile-review-proof-transport.ts";
 import { routeEnvelopeAllowed, sameNetworkAuthority, type NetworkRoutePolicy } from "./route-authority.ts";
 import type { SuggestionIdentityResolver } from "./profile-suggestion-endpoint.ts";
 
@@ -19,10 +18,7 @@ export interface CloudProfileReviewOwnerOptions {
 
 /** No cached owner, retry or identity fallback. This only consumes an existing attested turn. */
 export function cloudProfileReviewOwner(o: CloudProfileReviewOwnerOptions): SuggestionIdentityResolver {
-  const origin = new URL(o.origin);
-  const local = o.development && origin.protocol === "http:" && ["127.0.0.1", "localhost"].includes(origin.hostname);
-  if ((!local && origin.protocol !== "https:") || origin.username || origin.password || origin.search || origin.hash || origin.pathname !== "/"
-    || o.secret.length < 32) throw new Error("Profile review owner requires an exact trusted origin and service secret");
+  const post = profileReviewProofTransport(o);
   return async (context, tx) => {
     try {
       const now = o.now();
@@ -54,28 +50,12 @@ export function cloudProfileReviewOwner(o: CloudProfileReviewOwnerOptions): Sugg
       const selector = parseProfileReviewOwnerRequest({ version: 1, channel: context.channel, messageId: context.messageId, app: context.app, memberId: context.memberId,
         batchId: context.batchId, action: context.action, commandSha256: context.commandSha256, networkAuthority: context.networkAuthority, requestNonce });
       if (!selector) return null;
-      const body = JSON.stringify(selector), id = `${context.messageId}:suggestions:owner:${requestNonce}`;
-      const controller = new AbortController();
-      let timer: ReturnType<typeof setTimeout>;
-      const deadline = new Promise<null>(resolve => { timer = setTimeout(() => { controller.abort(); resolve(null); }, 3000); });
-      try {
-        const request = (async () => {
-          const response = await (o.fetch ?? fetch)(origin.origin + OWNER_PATH, { method: "POST", redirect: "manual", signal: controller.signal,
-          headers: { "Content-Type": "application/json", ...await svcSign(o.secret, { method: "POST", path: OWNER_PATH, id, body, nowS: Math.floor(now / 1000) }) }, body });
-          if (controller.signal.aborted || response.status !== 200) return null;
-          const bytes = await readCapped(response, 16 * 1024);
-          if (controller.signal.aborted || bytes === "too_large") return null;
-          const raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-          const auth = await svcVerify(o.secret, { method: "POST", path: OWNER_PATH, headers: response.headers, body: raw, nowS: Math.floor(o.now() / 1000) });
-          if (!auth.ok || auth.id !== `${id}:proof`) return null;
-          const after = o.now();
-          const proof = parseProfileReviewOwnerProof(JSON.parse(raw), selector, sha256(body), after);
-          if (!proof || after >= o.routePolicy.admitUntil || proof.expiresAt > o.routePolicy.admitUntil
-            || !routeEnvelopeAllowed(o.routePolicy, proof.networkAuthority, after)) return null;
-          return { userId: proof.userId, organizationId: proof.organizationId, chatId: proof.chatId, validUntil: proof.expiresAt };
-        })().catch(() => null);
-        return await Promise.race([request, deadline]);
-      } finally { clearTimeout(timer!); controller.abort(); }
+      const result = await post(OWNER_PATH, `${context.messageId}:suggestions:owner:${requestNonce}`, selector);
+      if (!result) return null;
+      const proof = parseProfileReviewOwnerProof(result.value, selector, result.selectorSha256, result.now);
+      if (!proof || result.now >= o.routePolicy.admitUntil || proof.expiresAt > o.routePolicy.admitUntil
+        || !routeEnvelopeAllowed(o.routePolicy, proof.networkAuthority, result.now)) return null;
+      return { userId: proof.userId, organizationId: proof.organizationId, chatId: proof.chatId, validUntil: proof.expiresAt };
     } catch { return null; }
   };
 }

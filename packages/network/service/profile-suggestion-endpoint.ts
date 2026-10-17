@@ -22,7 +22,11 @@ export interface SuggestionTurnIdentity {
 /** Cloud supplies its existing trusted binding lookup, never model-provided identity fields.
  * It must recheck the current user/org/chat binding and revocation using this transaction.
  */
-export type SuggestionIdentityResolver = (turn: SuggestionTurnIdentity, tx: SQL) => Promise<(Pick<SuggestionOwner, "userId" | "organizationId" | "chatId"> & { validUntil?: number }) | null>;
+export type SuggestionIdentityResolver = (turn: SuggestionTurnIdentity, tx: SQL) => Promise<(Pick<SuggestionOwner, "userId" | "organizationId" | "chatId"> & {
+  validUntil?: number;
+  /** Server-local transaction fence; never serialized or supplied in the request body. */
+  valid?: () => boolean;
+}) | null>;
 
 export interface SuggestionEndpointDeps {
   sql: SQL; now: () => number; secret?: string; routePolicy?: NetworkRoutePolicy;
@@ -55,6 +59,7 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
     || auth.id !== `${b.messageId}:suggestions:${action}` || (action !== "preview" && !validId(b.text, 2000))) return json({ error: "invalid_request" }, 400);
   const channel = b.channel, messageId = b.messageId, batchId = b.batchId;
   let proofValidUntil: number | undefined;
+  let proofValid: (() => boolean) | undefined;
   // Resolve the person from the signed, completed open turn. Model identity fields are not accepted.
   const resolve = async (tx: SQL): Promise<SuggestionOwner | null> => {
     if (!routeEnvelopeAllowed(d.routePolicy, b.networkAuthority, d.now())) return null;
@@ -77,6 +82,7 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
     if (!binding || !validId(binding.userId, 256) || !validId(binding.organizationId, 256) || !validId(binding.chatId, 256)) return null;
     if (binding.validUntil !== undefined && (!Number.isSafeInteger(binding.validUntil) || binding.validUntil <= d.now())) return null;
     proofValidUntil = binding.validUntil;
+    proofValid = binding.valid;
     return { personId: person.id, app, userId: binding.userId, organizationId: binding.organizationId, chatId: binding.chatId };
   };
   try {
@@ -86,6 +92,7 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
       const current = await resolve(tx);
       return !!current && Object.keys(who).every(k => who[k as keyof SuggestionOwner] === current[k as keyof SuggestionOwner]);
     }, { now: d.now, valid: () => (proofValidUntil === undefined || d.now() < proofValidUntil)
+      && (!proofValid || proofValid())
       && routeEnvelopeAllowed(d.routePolicy, b.networkAuthority, d.now())
       && (!d.routePolicy || d.now() < d.routePolicy.admitUntil) });
     if (action === "delete") {

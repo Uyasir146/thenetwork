@@ -34,6 +34,7 @@ import { ageAnswer, agesStated } from "../src/classify.ts";
 import { NetworkRuntime, type RuntimeHost } from "./runtime.ts";
 import { effectiveParticipation } from "./snapshot.ts";
 import { ProfileSuggestions, type SuggestionAuthorization } from "./profile-suggestions.ts";
+import { profileReviewFromEnv } from "./profile-review-factory.ts";
 import { Inbox, type CollectedReply } from "./inbox.ts";
 import { networkRoutePolicy, routeEnvelopeAllowed, sameNetworkAuthority, type NetworkRoutePolicy } from "./route-authority.ts";
 import { TURN_PATH, TURN_RECEIPT_PATH, SET_STATE_PATH, SIGNALS_PATH, UPDATES_PATH, type SetStateRequest, type TurnRequest, type TurnResponse } from "../../core/src/svc/contract.ts";
@@ -331,9 +332,10 @@ export class NetworkService implements RuntimeHost {
     const specs = o.networks?.length ? o.networks : [{ id: o.id ?? "ntwrk:nyc" }];
     // Each network's tick holds one connection for its advisory lock and needs more inside it: size the pool from the network count.
     this.sql = new SQL({ url: o.url, max: Math.max(8, 2 * specs.length + 4), connection: { application_name: `network-service:${this.instance}` } });
-    this.suggestionIdentity = o.profileSuggestionIdentity;
-    this.suggestionAuthorization = o.profileSuggestionAuthorization;
-    this.profileSuggestions = new ProfileSuggestions(this.sql, o.profileSuggestionAuthorization ?? (async () => false));
+    const profileReview = profileReviewFromEnv(this.env, () => this.clock.now());
+    this.suggestionIdentity = o.profileSuggestionIdentity ?? profileReview.profileSuggestionIdentity;
+    this.suggestionAuthorization = o.profileSuggestionAuthorization ?? profileReview.profileSuggestionAuthorization;
+    this.profileSuggestions = new ProfileSuggestions(this.sql, this.suggestionAuthorization ?? (async () => false));
     this.people = o.people ?? new PgPeopleStore(this.sql);
     this.cost = new CostLedger({ sink: new PgCostSink(this.sql), clock: this.clock, rates: costRatesFromEnv(this.env), log: this.log });
     // Opt-in only. One process-wide budget covers all apps and provider retries.

@@ -12,6 +12,9 @@ import { svcSign, svcVerify } from "../../core/src/svc/svc-auth.ts";
 import { SUGGESTION_PATH, type SuggestionIdentityResolver, type SuggestionTurnIdentity } from "../service/profile-suggestion-endpoint.ts";
 import { cloudProfileReviewOwner } from "../service/cloud-profile-review-owner.ts";
 import { PROFILE_REVIEW_OWNER_PATH, parseProfileReviewOwnerRequest } from "../../core/src/svc/profile-review-owner.ts";
+import { PROFILE_REVIEW_SOURCE_PATH, parseProfileReviewSourceRequest, type ProfileReviewSourceRequest } from "../../core/src/svc/profile-review-source.ts";
+import { profileReviewFactory, profileReviewFromEnv } from "../service/profile-review-factory.ts";
+import type { NetworkRoutePolicy } from "../service/route-authority.ts";
 
 const now = Date.UTC(2026, 9, 17, 12);
 const db = `profile_suggestions_${process.pid}`;
@@ -253,13 +256,15 @@ async function storedTurn(messageId: string, text: string, app = "ntwrk", member
   await sql`insert into network.messages(id,app_id,member_id,direction,body,ts)
     values(${`in:blooio:${messageId}`},${app},${memberId},'inbound',${text},${new Date(now)})`;
 }
-async function reviewHttp(resolveIdentity?: SuggestionIdentityResolver, authorizeSource?: SuggestionAuthorization) {
+async function reviewHttp(resolveIdentity?: SuggestionIdentityResolver, authorizeSource?: SuggestionAuthorization, routePolicy?: NetworkRoutePolicy,
+  bootstrapEnv?: Record<string, string>) {
   const clock = new SimClock(now);
-  const service = new NetworkService({ url: `${base}/${db}`, clock, env: { PLATFORM_ENV: "dev", SERVICE_TURN_SECRET: httpSecret },
+  const service = new NetworkService({ url: `${base}/${db}`, clock, env: { PLATFORM_ENV: routePolicy ? "staging" : "dev", SERVICE_TURN_SECRET: httpSecret,
+    PLATFORM_HASH_KEY: "synthetic-review-factory-test-hash-key", ...(routePolicy ? { NETWORK_ROUTE_AUTHORITY_POLICY: JSON.stringify(routePolicy) } : {}), ...bootstrapEnv },
     networks: [{ id: "ntwrk:nyc" }], log: () => {}, profileSuggestionIdentity: resolveIdentity,
-    profileSuggestionAuthorization: authorizeSource ?? (async () => active) });
+    profileSuggestionAuthorization: bootstrapEnv ? undefined : authorizeSource ?? (async () => active) });
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: service.fetch });
-  return { clock, async stop() { server.stop(true); await service.close(); },
+  return { clock, service, async stop() { server.stop(true); await service.close(); },
     async post(action: string, messageId: string, batchId: string, extra: Record<string, unknown> = {}, signedPath?: string) {
       const path = SUGGESTION_PATH + action;
       const body = JSON.stringify({ channel: "blooio", messageId, batchId, ...extra });
@@ -377,9 +382,28 @@ async function ownerProofFixture() {
   let signed = true;
   let responseStatus = 200;
   let alter: (proof: Record<string, unknown>) => void = () => {};
+  let sourceCalls = 0;
+  let sourceAllowed: (request: ProfileReviewSourceRequest) => boolean = () => false;
+  let alterSource: (proof: Record<string, unknown>) => void = () => {};
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
     calls++;
-    expect(new URL(req.url).pathname).toBe(PROFILE_REVIEW_OWNER_PATH);
+    const path = new URL(req.url).pathname;
+    if (path === PROFILE_REVIEW_SOURCE_PATH) {
+      sourceCalls++;
+      const raw = await req.text();
+      const request = parseProfileReviewSourceRequest(JSON.parse(raw));
+      const auth = await svcVerify(httpSecret, { method: "POST", path, headers: req.headers, body: raw, nowS: Math.floor(now / 1000) });
+      expect(auth.ok).toBe(true);
+      if (!request || !auth.ok) return new Response(null, { status: 403 });
+      expect(auth.id).toBe(`${request.review.messageId}:suggestions:source:${request.review.requestNonce}`);
+      if (!sourceAllowed(request)) return new Response(null, { status: 403 });
+      const proof: Record<string, unknown> = { version: 1, purpose: "network-profile-learning-source-v1", requestSha256: digest(raw),
+        requestNonce: request.review.requestNonce, ...identity, personId: request.personId, app: request.review.app, issuedAt: now, expiresAt: now + 5000 };
+      alterSource(proof);
+      const body = JSON.stringify(proof);
+      return new Response(body, { headers: await svcSign(httpSecret, { method: "POST", path, id: `${auth.id}:proof`, body, nowS: Math.floor(now / 1000) }) });
+    }
+    expect(path).toBe(PROFILE_REVIEW_OWNER_PATH);
     const raw = await req.text();
     const request = parseProfileReviewOwnerRequest(JSON.parse(raw));
     const auth = await svcVerify(httpSecret, { method: "POST", path: PROFILE_REVIEW_OWNER_PATH, headers: req.headers, body: raw, nowS: Math.floor(now / 1000) });
@@ -396,6 +420,7 @@ async function ownerProofFixture() {
   const resolve = cloudProfileReviewOwner(options);
   return { context, identity, policy, options, async read(c = context) { return sql.begin(tx => resolve(c, tx)); },
     get calls() { return calls; }, setAlter(fn: typeof alter) { alter = fn; }, setSigned(value: boolean) { signed = value; },
+    get sourceCalls() { return sourceCalls; }, setSourceAllowed(fn: typeof sourceAllowed) { sourceAllowed = fn; }, setSourceAlter(fn: typeof alterSource) { alterSource = fn; },
     setStatus(value: number) { responseStatus = value; }, stop() { server.stop(true); } };
 }
 
@@ -516,4 +541,145 @@ test("a fence expiring after database writes rolls the full review transaction b
     expect((await sql`select revision from platform.profile_suggestion_batches where id=${b.id}`)[0].revision).toBe(1);
     expect((await sql`select value,status from platform.profile_suggestions where batch_id=${b.id}`)[0]).toMatchObject({ value: "I enjoy climbing", status: "proposed" });
   }
+});
+
+async function scopedPending(f: Awaited<ReturnType<typeof ownerProofFixture>>) {
+  const who = { ...owner, ...f.identity };
+  const connectionId = randomUUID();
+  const batch = (await new ProfileSuggestions(sql, async () => true).propose(who, input([{ ...candidate(), connectionId }]), now))!;
+  const text = `accept ${batch.id}.1 1 private`;
+  f.context.batchId = batch.id;
+  f.context.commandSha256 = digest(text);
+  await sql`update network.messages set body=${text} where id='in:blooio:owner-proof'`;
+  const consent = { connectionId, source: "gmail" as const, windowStart: now - 60_000, windowEnd: now,
+    timezone: "America/Los_Angeles", allowedKinds: ["interest" as const], retainOnDisconnect: false };
+  return { who, batch, text, consent };
+}
+async function reviewCommandTurn(f: Awaited<ReturnType<typeof ownerProofFixture>>, id: string, text: string) {
+  await storedTurn(id, text);
+  await sql`update platform.inbound set request_hash=${digest(`synthetic-signed-${id}`)},network_authority=${f.policy.authority}::jsonb
+    where id=${`msg:blooio:${id}`}`;
+}
+
+test("review bootstrap defaults off and requires an explicit isolated route, origin and key", async () => {
+  expect(profileReviewFromEnv({}, () => now)).toEqual({});
+  expect(profileReviewFromEnv({ NETWORK_PROFILE_REVIEW_ENABLED: "0" }, () => now)).toEqual({});
+  expect(() => profileReviewFromEnv({ NETWORK_PROFILE_REVIEW_ENABLED: "yes" }, () => now)).toThrow();
+  expect(() => profileReviewFromEnv({ NETWORK_PROFILE_REVIEW_ENABLED: "1" }, () => now)).toThrow();
+  const f = await ownerProofFixture();
+  try {
+    const configured = profileReviewFromEnv({ NETWORK_PROFILE_REVIEW_ENABLED: "1", PLATFORM_ENV: "staging",
+      NETWORK_ROUTE_AUTHORITY_POLICY: JSON.stringify(f.policy), NETWORK_CLOUD_DELIVERY_ORIGIN: "https://cloud.example", SERVICE_TURN_SECRET: httpSecret }, () => now);
+    expect(typeof configured.profileSuggestionIdentity).toBe("function");
+    expect(typeof configured.profileSuggestionAuthorization).toBe("function");
+    expect(f.calls).toBe(0);
+  } finally { f.stop(); }
+});
+
+test("the normal service constructor registers the opted-in factory and still defaults missing consent to denied", async () => {
+  const f = await ownerProofFixture();
+  const p = await scopedPending(f);
+  const originalFetch = globalThis.fetch;
+  // Only this synthetic origin is redirected in this test process. Signature bytes and both real HTTP handlers are unchanged.
+  globalThis.fetch = Object.assign(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    return originalFetch(url.origin === "https://review-bootstrap.invalid" ? new URL(url.pathname, f.options.origin) : input, init);
+  }, { preconnect: originalFetch.preconnect });
+  const http = await reviewHttp(undefined, undefined, f.policy, { NETWORK_PROFILE_REVIEW_ENABLED: "1", NETWORK_CLOUD_DELIVERY_ORIGIN: "https://review-bootstrap.invalid" });
+  try {
+    const args = { text: p.text, networkAuthority: f.policy.authority };
+    expect((await http.post("decide", "owner-proof", p.batch.id, args)).status).toBe(403);
+    expect(f.sourceCalls).toBe(1);
+    f.setSourceAllowed(() => true);
+    expect((await http.post("decide", "owner-proof", p.batch.id, args)).body.kind).toBe("saved");
+    expect(await facets()).toHaveLength(1);
+    const before = f.calls;
+    expect(await http.service.profileSuggestions.propose(p.who, input([{ ...candidate(), connectionId: p.consent.connectionId }]), now)).toBeNull();
+    expect(f.calls).toBe(before);
+  } finally { globalThis.fetch = originalFetch; await http.stop(); f.stop(); }
+});
+
+test("source authorization requires this exact transaction's canonical owner and exact requested consent scope", async () => {
+  const f = await ownerProofFixture();
+  try {
+    const p = await scopedPending(f);
+    const callbacks = profileReviewFactory(f.options);
+    f.setSourceAllowed(request => request.personId === p.who.personId && JSON.stringify(request.consent) === JSON.stringify(p.consent));
+    expect(await callbacks.profileSuggestionAuthorization(p.who, p.consent, sql)).toBe(false);
+    await sql.begin(async tx => {
+      expect(await callbacks.profileSuggestionIdentity(f.context, tx)).toMatchObject(f.identity);
+      expect(await callbacks.profileSuggestionAuthorization({ ...p.who, userId: randomUUID() }, p.consent, tx)).toBe(false);
+      expect(await callbacks.profileSuggestionAuthorization(p.who, p.consent, sql)).toBe(false);
+      for (const wrong of [{ windowStart: p.consent.windowStart - 1 }, { retainOnDisconnect: true }, { connectionId: randomUUID() }, { source: "google_calendar" as const }])
+        expect(await callbacks.profileSuggestionAuthorization(p.who, { ...p.consent, ...wrong }, tx)).toBe(false);
+      expect(await callbacks.profileSuggestionAuthorization(p.who, p.consent, tx)).toBe(true);
+    });
+    await sql.begin(async tx => { expect(await callbacks.profileSuggestionAuthorization(p.who, p.consent, tx)).toBe(false); });
+  } finally { f.stop(); }
+});
+
+test("absent learning permission denies saving but keeps private preview, rejection and deletion usable", async () => {
+  const f = await ownerProofFixture();
+  const p = await scopedPending(f);
+  const callbacks = profileReviewFactory(f.options);
+  const http = await reviewHttp(callbacks.profileSuggestionIdentity, callbacks.profileSuggestionAuthorization, f.policy);
+  try {
+    const networkAuthority = f.policy.authority;
+    await reviewCommandTurn(f, "preview-source-denied", `preview ${p.batch.id}`);
+    expect((await http.post("preview", "preview-source-denied", p.batch.id, { networkAuthority })).status).toBe(200);
+    expect(f.sourceCalls).toBe(0);
+    expect((await http.post("decide", "owner-proof", p.batch.id, { text: p.text, networkAuthority })).status).toBe(403);
+    expect(f.sourceCalls).toBe(1);
+    const text = `reject ${p.batch.id}.1 1`;
+    await reviewCommandTurn(f, "reject-source-denied", text);
+    expect((await http.post("decide", "reject-source-denied", p.batch.id, { text, networkAuthority })).body).toMatchObject({ kind: "saved", accepted: [], reviewText: "0 saved; 1 rejected." });
+    await reviewCommandTurn(f, "delete-source-denied", `delete ${p.batch.id}`);
+    expect((await http.post("delete", "delete-source-denied", p.batch.id, { text: `delete ${p.batch.id}`, networkAuthority })).body.kind).toBe("deleted");
+    expect(f.sourceCalls).toBe(1);
+    expect(await facets()).toHaveLength(0);
+    expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(0);
+  } finally { await http.stop(); f.stop(); }
+});
+
+test("only a fresh matching five-second learning proof permits saving; wrong proof fields and old purpose deny", async () => {
+  const f = await ownerProofFixture();
+  const p = await scopedPending(f);
+  const callbacks = profileReviewFactory(f.options);
+  const http = await reviewHttp(callbacks.profileSuggestionIdentity, callbacks.profileSuggestionAuthorization, f.policy);
+  try {
+    f.setSourceAllowed(() => true);
+    const args = { text: p.text, networkAuthority: f.policy.authority };
+    for (const wrong of [{ purpose: "personal_google_context_v1" }, { requestNonce: randomUUID() }, { requestSha256: digest("other scope") },
+      { userId: randomUUID() }, { organizationId: randomUUID() }, { chatId: `personal:${randomUUID()}` }, { personId: randomUUID() },
+      { app: "friends" }, { expiresAt: now }, { issuedAt: now + 1 }, { expiresAt: now + 5001 }]) {
+      f.setSourceAlter(proof => Object.assign(proof, wrong));
+      expect((await http.post("decide", "owner-proof", p.batch.id, args)).status).toBe(403);
+      expect(await facets()).toHaveLength(0);
+    }
+    f.setSourceAlter(() => {});
+    expect((await http.post("decide", "owner-proof", p.batch.id, args)).body.kind).toBe("saved");
+    expect(await facets()).toEqual([expect.objectContaining({ source: "gmail", inferred: true, confirmedByMember: true, scope: "agent_private" })]);
+  } finally { await http.stop(); f.stop(); }
+});
+
+test("source proof expiry after authorization rolls saving back while revocation cleanup stays independent", async () => {
+  const f = await ownerProofFixture();
+  const p = await scopedPending(f);
+  let clock: SimClock;
+  const callbacks = profileReviewFactory({ ...f.options, now: () => clock?.now() ?? now });
+  f.setSourceAllowed(() => true);
+  const http = await reviewHttp(callbacks.profileSuggestionIdentity, async (who, consent, tx) => {
+    const allowed = await callbacks.profileSuggestionAuthorization(who, consent, tx);
+    clock.advance(5000);
+    return allowed;
+  }, f.policy);
+  clock = http.clock;
+  try {
+    expect((await http.post("decide", "owner-proof", p.batch.id, { text: p.text, networkAuthority: f.policy.authority })).status).toBe(503);
+    expect(await facets()).toHaveLength(0);
+    expect((await sql`select value,status from platform.profile_suggestions where batch_id=${p.batch.id}`)[0]).toMatchObject({ value: "I enjoy climbing", status: "proposed" });
+    // A connector-owned revoke/delete does not need a new collection grant or a source proof.
+    await new ProfileSuggestions(sql, async () => false).disconnect(p.who, p.consent.connectionId);
+    expect((await sql`select value,status from platform.profile_suggestions where batch_id=${p.batch.id}`)[0]).toMatchObject({ value: null, status: "withdrawn" });
+  } finally { await http.stop(); f.stop(); }
 });
