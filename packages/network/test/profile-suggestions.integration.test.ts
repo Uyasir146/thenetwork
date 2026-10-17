@@ -1,15 +1,17 @@
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
 import { SQL } from "bun";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { applySchema, devPgUp, DEV_PG_PORT } from "../../observatory/db/dev-pg.ts";
 import { loadSnapshot } from "../service/snapshot.ts";
-import { ProfileSuggestions, type SuggestionOwner, type SourceSuggestion } from "../service/profile-suggestions.ts";
+import { ProfileSuggestions, type SuggestionOwner, type SourceSuggestion, type SuggestionAuthorization } from "../service/profile-suggestions.ts";
 import { PgPeopleStore } from "../../platform/src/pg-store.ts";
 import { SimClock } from "@thenetwork/core";
 import { NetworkService } from "../service/service.ts";
 import { renderSuggestionReview, reviewSuggestionMessage } from "../service/profile-suggestion-review.ts";
-import { svcSign } from "../../core/src/svc/svc-auth.ts";
-import { SUGGESTION_PATH, type SuggestionIdentityResolver } from "../service/profile-suggestion-endpoint.ts";
+import { svcSign, svcVerify } from "../../core/src/svc/svc-auth.ts";
+import { SUGGESTION_PATH, type SuggestionIdentityResolver, type SuggestionTurnIdentity } from "../service/profile-suggestion-endpoint.ts";
+import { cloudProfileReviewOwner } from "../service/cloud-profile-review-owner.ts";
+import { PROFILE_REVIEW_OWNER_PATH, parseProfileReviewOwnerRequest } from "../../core/src/svc/profile-review-owner.ts";
 
 const now = Date.UTC(2026, 9, 17, 12);
 const db = `profile_suggestions_${process.pid}`;
@@ -251,11 +253,11 @@ async function storedTurn(messageId: string, text: string, app = "ntwrk", member
   await sql`insert into network.messages(id,app_id,member_id,direction,body,ts)
     values(${`in:blooio:${messageId}`},${app},${memberId},'inbound',${text},${new Date(now)})`;
 }
-async function reviewHttp(resolveIdentity?: SuggestionIdentityResolver) {
+async function reviewHttp(resolveIdentity?: SuggestionIdentityResolver, authorizeSource?: SuggestionAuthorization) {
   const clock = new SimClock(now);
   const service = new NetworkService({ url: `${base}/${db}`, clock, env: { PLATFORM_ENV: "dev", SERVICE_TURN_SECRET: httpSecret },
     networks: [{ id: "ntwrk:nyc" }], log: () => {}, profileSuggestionIdentity: resolveIdentity,
-    profileSuggestionAuthorization: async () => active });
+    profileSuggestionAuthorization: authorizeSource ?? (async () => active) });
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: service.fetch });
   return { clock, async stop() { server.stop(true); await service.close(); },
     async post(action: string, messageId: string, batchId: string, extra: Record<string, unknown> = {}, signedPath?: string) {
@@ -358,4 +360,160 @@ test("HTTP identity revocation during the request and promotion faults roll back
     expect(await facets()).toHaveLength(0);
     expect((await sql`select value,status from platform.profile_suggestions`)[0]).toMatchObject({ value: "I enjoy climbing", status: "proposed" });
   } finally { await http.stop(); }
+});
+
+const digest = (text: string) => createHash("sha256").update(text).digest("hex");
+async function ownerProofFixture() {
+  const authority = { version: 1 as const, routeId: "fixture-review", generation: "generation-one", audience: "network-review-fixture", realmId: "fixture-realm" };
+  const policy = { authority, admitUntil: now + 120_000, drainUntil: now + 180_000 };
+  const identity = { userId: randomUUID(), organizationId: randomUUID(), chatId: `personal:${randomUUID()}` };
+  const batchId = randomUUID();
+  const text = `accept ${batchId}.1 1 private`;
+  await storedTurn("owner-proof", text);
+  await sql`update platform.inbound set request_hash=${digest("synthetic-signed-original-request")},network_authority=${authority}::jsonb where id='msg:blooio:owner-proof'`;
+  const context: SuggestionTurnIdentity = { personId: owner.personId, memberId: "owned-member", app: "ntwrk", channel: "blooio", messageId: "owner-proof",
+    action: "decide", batchId, commandSha256: digest(text), networkAuthority: authority };
+  let calls = 0;
+  let signed = true;
+  let responseStatus = 200;
+  let alter: (proof: Record<string, unknown>) => void = () => {};
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+    calls++;
+    expect(new URL(req.url).pathname).toBe(PROFILE_REVIEW_OWNER_PATH);
+    const raw = await req.text();
+    const request = parseProfileReviewOwnerRequest(JSON.parse(raw));
+    const auth = await svcVerify(httpSecret, { method: "POST", path: PROFILE_REVIEW_OWNER_PATH, headers: req.headers, body: raw, nowS: Math.floor(now / 1000) });
+    expect(auth.ok).toBe(true);
+    if (!request || !auth.ok) return new Response(null, { status: 403 });
+    expect(auth.id).toBe(`${request.messageId}:suggestions:owner:${request.requestNonce}`);
+    const proof: Record<string, unknown> = { ...request, ...identity, purpose: "network-profile-review-owner-v1", selectorSha256: digest(raw), issuedAt: now, expiresAt: now + 30_000 };
+    alter(proof);
+    const body = JSON.stringify(proof);
+    return new Response(body, { status: responseStatus, headers: signed ? await svcSign(httpSecret, { method: "POST", path: PROFILE_REVIEW_OWNER_PATH,
+      id: `${auth.id}:proof`, body, nowS: Math.floor(now / 1000) }) : {} });
+  } });
+  const options = { origin: server.url.origin, secret: httpSecret, development: true, routePolicy: policy, now: () => now };
+  const resolve = cloudProfileReviewOwner(options);
+  return { context, identity, policy, options, async read(c = context) { return sql.begin(tx => resolve(c, tx)); },
+    get calls() { return calls; }, setAlter(fn: typeof alter) { alter = fn; }, setSigned(value: boolean) { signed = value; },
+    setStatus(value: number) { responseStatus = value; }, stop() { server.stop(true); } };
+}
+
+test("owner consumer verifies the actual stored signed turn and signed nonce-bound Cloud proof without caching", async () => {
+  const f = await ownerProofFixture();
+  try {
+    expect(await f.read()).toEqual({ ...f.identity, validUntil: now + 30_000 });
+    expect(await f.read()).toEqual({ ...f.identity, validUntil: now + 30_000 });
+    expect(f.calls).toBe(2);
+    // A valid signature alone cannot choose a different Network person, turn or command.
+    for (const wrong of [{ personId: randomUUID() }, { memberId: "other" }, { app: "friends" as const }, { messageId: "missing" },
+      { commandSha256: digest("model wording") }, { batchId: randomUUID() }, { action: "preview" as const }])
+      expect(await f.read({ ...f.context, ...wrong })).toBeNull();
+    expect(f.calls).toBe(2);
+    await sql`update platform.inbound set request_hash=null where id='msg:blooio:owner-proof'`;
+    expect(await f.read()).toBeNull();
+    expect(f.calls).toBe(2);
+  } finally { f.stop(); }
+});
+
+test("owner consumer rejects wrong selectors, stale/future proofs, unsigned replies, redirects and excess data", async () => {
+  const f = await ownerProofFixture();
+  try {
+    for (const wrong of [{ requestNonce: randomUUID() }, { selectorSha256: digest("other request") }, { app: "friends" }, { memberId: "other" },
+      { commandSha256: digest("different command") }, { networkAuthority: { ...f.policy.authority, generation: "other" } },
+      { expiresAt: now }, { issuedAt: now + 1 }, { expiresAt: now + 30_001 }, { userId: "unverified-owner" }, { chatId: "other-room" }, { unexpected: true }]) {
+      f.setAlter(p => Object.assign(p, wrong));
+      expect(await f.read()).toBeNull();
+    }
+    f.setAlter(() => {});
+    f.setSigned(false);
+    expect(await f.read()).toBeNull();
+    f.setSigned(true);
+    f.setStatus(302);
+    expect(await f.read()).toBeNull();
+    f.setStatus(200);
+    f.setAlter(p => { p.excess = "x".repeat(17 * 1024); });
+    expect(await f.read()).toBeNull();
+  } finally { f.stop(); }
+});
+
+test("owner consumer refuses expired routes and stale or future stored turns before any remote lookup", async () => {
+  const f = await ownerProofFixture();
+  try {
+    await sql`update platform.inbound set arrived_at=${new Date(now - 300_000)} where id='msg:blooio:owner-proof'`;
+    expect(await f.read()).toBeNull();
+    await sql`update platform.inbound set arrived_at=${new Date(now + 1)} where id='msg:blooio:owner-proof'`;
+    expect(await f.read()).toBeNull();
+    await sql`update platform.inbound set arrived_at=${new Date(now)} where id='msg:blooio:owner-proof'`;
+    f.policy.admitUntil = now;
+    expect(await f.read()).toBeNull();
+    expect(f.calls).toBe(0);
+  } finally { f.stop(); }
+});
+
+test("valid Cloud proof cannot cross a batch owner or substitute for explicit Network source consent", async () => {
+  const f = await ownerProofFixture();
+  try {
+    const b = (await store.propose(owner, input(), now))!;
+    const consumer = cloudProfileReviewOwner(f.options);
+    const guarded = new ProfileSuggestions(sql, async () => true, async (who, tx) => {
+      const proof = await consumer(f.context, tx);
+      return !!proof && who.userId === proof.userId && who.organizationId === proof.organizationId && who.chatId === proof.chatId;
+    });
+    const decision = { batchId: b.id, revision: 1, decisions: [{ suggestionId: b.suggestions[0]!.id, action: "accept" as const }] };
+    expect(await guarded.decide(owner, decision, now)).toEqual({ kind: "denied" });
+    expect(await facets()).toHaveLength(0);
+    const same = { ...owner, ...f.identity };
+    const sourceDenied = new ProfileSuggestions(sql, async () => false);
+    const privateStore = new ProfileSuggestions(sql, async () => true);
+    const ownBatch = (await privateStore.propose(same, input(), now))!;
+    expect(await sourceDenied.decide(same, { batchId: ownBatch.id, revision: 1, decisions: [{ suggestionId: ownBatch.suggestions[0]!.id, action: "accept" }] }, now)).toEqual({ kind: "denied" });
+    expect(await facets()).toHaveLength(0);
+  } finally { f.stop(); }
+});
+
+test("owner lookup has a whole-request deadline with one attempt and refuses insecure origin configuration", async () => {
+  const f = await ownerProofFixture();
+  try {
+    expect(() => cloudProfileReviewOwner({ ...f.options, development: false })).toThrow();
+    expect(() => cloudProfileReviewOwner({ ...f.options, origin: "https://example.test/other" })).toThrow();
+    let attempts = 0;
+    const resolve = cloudProfileReviewOwner({ ...f.options, fetch: Object.assign(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      attempts++; return await new Promise<Response>(() => {});
+    }, { preconnect() {} }) });
+    const started = performance.now();
+    expect(await sql.begin(tx => resolve(f.context, tx))).toBeNull();
+    expect(performance.now() - started).toBeLessThan(4000);
+    expect(attempts).toBe(1);
+  } finally { f.stop(); }
+});
+
+test("HTTP cannot save after proof or batch expiry during asynchronous source authorization", async () => {
+  for (const expires of ["proof", "batch"]) {
+    const b = (await store.propose(owner, input(), now))!;
+    const text = `accept ${b.id}.1 1 private`;
+    await storedTurn(expires, text);
+    let clock: SimClock;
+    const http = await reviewHttp(async turn => ({ ...(await boundIdentity(turn, sql))!, validUntil: now + (expires === "proof" ? 1 : 120_000) }),
+      async () => { clock.advance(expires === "proof" ? 2 : 60_000); return true; });
+    clock = http.clock;
+    try {
+      expect((await http.post("decide", expires, b.id, { text })).status).toBe(503);
+      expect(await facets()).toHaveLength(0);
+      expect((await sql`select value,status from platform.profile_suggestions where batch_id=${b.id}`)[0]).toMatchObject({ value: "I enjoy climbing", status: "proposed" });
+    } finally { await http.stop(); }
+  }
+});
+
+test("a fence expiring after database writes rolls the full review transaction back", async () => {
+  const b = (await store.propose(owner, input(), now))!;
+  for (const editing of [false, true]) {
+    let checks = 0;
+    const guarded = new ProfileSuggestions(sql, async () => true, undefined, { now: () => now, valid: () => ++checks < (editing ? 3 : 4) });
+    await expect(guarded.decide(owner, { batchId: b.id, revision: 1, decisions: [{ suggestionId: b.suggestions[0]!.id, action: "accept",
+      ...(editing ? { editedValue: "I enjoy hiking" } : {}) }] }, now)).rejects.toThrow("expired");
+    expect(await facets()).toHaveLength(0);
+    expect((await sql`select revision from platform.profile_suggestion_batches where id=${b.id}`)[0].revision).toBe(1);
+    expect((await sql`select value,status from platform.profile_suggestions where batch_id=${b.id}`)[0]).toMatchObject({ value: "I enjoy climbing", status: "proposed" });
+  }
 });

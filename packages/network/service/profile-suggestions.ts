@@ -33,7 +33,15 @@ const valueOK = (s: unknown): s is string => typeof s === "string" && s.trim().l
 /** Private review storage; only accepted values enter the existing canonical facet table. */
 export class ProfileSuggestions {
   constructor(private readonly sql: SQL, private readonly authorize: SuggestionAuthorization,
-    private readonly authorizeOwner?: (owner: SuggestionOwner, tx: SQL) => Promise<boolean>) {}
+    private readonly authorizeOwner?: (owner: SuggestionOwner, tx: SQL) => Promise<boolean>,
+    private readonly fence?: { now: () => number; valid: () => boolean }) {}
+
+  private checkAuthority(batch?: { expires_at: unknown }) {
+    if (!this.fence) return;
+    const now = this.fence.now();
+    if (!Number.isSafeInteger(now) || !this.fence.valid() || (batch && new Date(batch.expires_at as string).getTime() <= now))
+      throw new Error("Suggestion authority expired during transaction");
+  }
 
   private async owned(tx: SQL, owner: SuggestionOwner) {
     await tx`select set_config('app.app_id', ${owner.app}, true)`;
@@ -49,6 +57,7 @@ export class ProfileSuggestions {
       where n.app_id=${owner.app} and p.id=${owner.personId} and p.deleted_at is null
         and m.state<>'removed' for update of n, m`;
     if (rows[0] && this.authorizeOwner && !await this.authorizeOwner(owner, tx)) return undefined;
+    this.checkAuthority();
     return rows[0] as { id: string; eligible: boolean } | undefined;
   }
 
@@ -103,14 +112,19 @@ export class ProfileSuggestions {
 
   async getPendingBatch(owner: SuggestionOwner, id: string, now: number): Promise<SuggestionReviewBatch | null> {
     if (!Number.isFinite(now)) return null;
-    return this.sql.begin(async tx => { const b = await this.batch(tx, owner, id); return b ? this.view(tx, b, now) : null; });
+    return this.sql.begin(async tx => {
+      const b = await this.batch(tx, owner, id);
+      const value = b ? await this.view(tx, b, this.fence?.now() ?? now) : null;
+      this.checkAuthority(value ? b : undefined);
+      return value;
+    });
   }
 
   async decide(owner: SuggestionOwner, input: { batchId: string; revision: number; decisions: SuggestionDecision[] }, now: number): Promise<SuggestionDecisionResult> {
     if (!Number.isFinite(now)) return { kind: "denied" };
     return this.sql.begin(async tx => {
       const b = await this.batch(tx, owner, input.batchId);
-      if (b && new Date(b.expires_at).getTime() <= now) {
+      if (b && new Date(b.expires_at).getTime() <= (this.fence?.now() ?? now)) {
         await tx`update platform.profile_suggestions set status='expired',value=null,tags='{}' where batch_id=${b.id} and status='proposed'`;
         return { kind: "denied" };
       }
@@ -126,16 +140,20 @@ export class ProfileSuggestions {
             windowStart: new Date(b.window_start).getTime(), windowEnd: new Date(b.window_end).getTime(), timezone: b.timezone,
             allowedKinds: b.allowed_kinds, retainOnDisconnect: b.retain_on_disconnect }, tx)))) return { kind: "denied" };
       }
+      this.checkAuthority(b);
       // An edit or scope change is always a new preview, never an implicit acceptance.
       if (input.decisions.some(d => d.editedValue !== undefined || (d.scope !== undefined && d.scope !== rows.find((r: any) => r.id === d.suggestionId).privacy_scope))) {
         for (const d of input.decisions) if (d.action === "accept") await tx`update platform.profile_suggestions
           set value=coalesce(${d.editedValue?.trim() ?? null},value),privacy_scope=coalesce(${d.scope ?? null},privacy_scope),
             tags=case when ${d.editedValue !== undefined} then '{}'::text[] else tags end where id=${d.suggestionId}`;
         const [updated] = await tx`update platform.profile_suggestion_batches set revision=revision+1 where id=${b.id} returning *`;
-        return { kind: "preview", batch: (await this.view(tx, updated, now))! };
+        const preview = await this.view(tx, updated, this.fence?.now() ?? now);
+        this.checkAuthority(b);
+        return { kind: "preview", batch: preview! };
       }
       const accepted: string[] = [], rejected: string[] = [];
       for (const d of input.decisions) {
+        this.checkAuthority(b);
         const s = rows.find((r: any) => r.id === d.suggestionId)!;
         if (d.action === "accept") {
           const factId = `source-suggestion:${s.id}`;
@@ -149,6 +167,7 @@ export class ProfileSuggestions {
         }
       }
       await tx`update platform.profile_suggestion_batches set revision=revision+1 where id=${b.id}`;
+      this.checkAuthority(b);
       return { kind: "saved", accepted, rejected };
     });
   }
@@ -157,7 +176,9 @@ export class ProfileSuggestions {
     return this.sql.begin(async tx => {
       const b = await this.batch(tx, owner, id);
       if (!b) return false;
+      this.checkAuthority();
       await tx`delete from platform.profile_suggestion_batches where id=${b.id}`;
+      this.checkAuthority();
       return true;
     });
   }

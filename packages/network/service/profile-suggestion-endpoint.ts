@@ -1,4 +1,6 @@
 import type { SQL } from "bun";
+import { createHash } from "node:crypto";
+import { parseNetworkRouteAuthorityV1, type NetworkRouteAuthorityV1 } from "../../core/src/svc/contract.ts";
 import type { AppId } from "../../platform/src/apps.ts";
 import { isAppId } from "../../platform/src/apps.ts";
 import { readCapped } from "../../platform/src/body.ts";
@@ -14,11 +16,13 @@ export type SuggestionReviewResponse =
   | { kind: "deleted" | "denied"; reviewText: string };
 export interface SuggestionTurnIdentity {
   personId: string; memberId: string; app: AppId; channel: "blooio" | "twilio"; messageId: string;
+  action: "preview" | "decide" | "delete"; batchId: string; commandSha256: string;
+  networkAuthority?: NetworkRouteAuthorityV1;
 }
 /** Cloud supplies its existing trusted binding lookup, never model-provided identity fields.
  * It must recheck the current user/org/chat binding and revocation using this transaction.
  */
-export type SuggestionIdentityResolver = (turn: SuggestionTurnIdentity, tx: SQL) => Promise<Pick<SuggestionOwner, "userId" | "organizationId" | "chatId"> | null>;
+export type SuggestionIdentityResolver = (turn: SuggestionTurnIdentity, tx: SQL) => Promise<(Pick<SuggestionOwner, "userId" | "organizationId" | "chatId"> & { validUntil?: number }) | null>;
 
 export interface SuggestionEndpointDeps {
   sql: SQL; now: () => number; secret?: string; routePolicy?: NetworkRoutePolicy;
@@ -50,6 +54,7 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
     || (b.channel !== "blooio" && b.channel !== "twilio") || !validId(b.messageId, 512) || !uuid(b.batchId)
     || auth.id !== `${b.messageId}:suggestions:${action}` || (action !== "preview" && !validId(b.text, 2000))) return json({ error: "invalid_request" }, 400);
   const channel = b.channel, messageId = b.messageId, batchId = b.batchId;
+  let proofValidUntil: number | undefined;
   // Resolve the person from the signed, completed open turn. Model identity fields are not accepted.
   const resolve = async (tx: SQL): Promise<SuggestionOwner | null> => {
     if (!routeEnvelopeAllowed(d.routePolicy, b.networkAuthority, d.now())) return null;
@@ -61,13 +66,17 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
     const [person] = await tx`select p.id from platform.people p join network.members n on n.person_id=p.id
       where p.phone_hash=${turn.sender_hash} and p.deleted_at is null and n.app_id=${app} and n.id=${memberId}`;
     if (!person) return null;
-    if (action !== "preview") {
-      const [message] = await tx`select body from network.messages where app_id=${app} and member_id=${memberId}
-        and id=${`in:${channel}:${messageId}`} and direction='inbound'`;
-      if (!message || message.body !== b.text) return null;
-    }
-    const binding = await d.resolveIdentity!({ personId: person.id, memberId, app, channel, messageId }, tx);
+    const [message] = await tx`select body from network.messages where app_id=${app} and member_id=${memberId}
+      and id=${`in:${channel}:${messageId}`} and direction='inbound'`;
+    if (!message || typeof message.body !== "string" || (action !== "preview" && message.body !== b.text)) return null;
+    const networkAuthority = parseNetworkRouteAuthorityV1(turn.network_authority);
+    const binding = await d.resolveIdentity!({ personId: person.id, memberId, app, channel, messageId,
+      action: action as SuggestionTurnIdentity["action"], batchId,
+      commandSha256: createHash("sha256").update(message.body).digest("hex"),
+      ...(networkAuthority ? { networkAuthority } : {}) }, tx);
     if (!binding || !validId(binding.userId, 256) || !validId(binding.organizationId, 256) || !validId(binding.chatId, 256)) return null;
+    if (binding.validUntil !== undefined && (!Number.isSafeInteger(binding.validUntil) || binding.validUntil <= d.now())) return null;
+    proofValidUntil = binding.validUntil;
     return { personId: person.id, app, userId: binding.userId, organizationId: binding.organizationId, chatId: binding.chatId };
   };
   try {
@@ -76,7 +85,9 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
     const store = new ProfileSuggestions(d.sql, d.authorizeSource ?? (async () => false), async (who, tx) => {
       const current = await resolve(tx);
       return !!current && Object.keys(who).every(k => who[k as keyof SuggestionOwner] === current[k as keyof SuggestionOwner]);
-    });
+    }, { now: d.now, valid: () => (proofValidUntil === undefined || d.now() < proofValidUntil)
+      && routeEnvelopeAllowed(d.routePolicy, b.networkAuthority, d.now())
+      && (!d.routePolicy || d.now() < d.routePolicy.admitUntil) });
     if (action === "delete") {
       if (b.text !== `delete ${batchId}`) return json({ error: "invalid_command" }, 400);
       return await store.deleteBatch(owner, batchId) ? json({ kind: "deleted", reviewText: "Deleted these suggestions and their linked saved facts." }) : json({ kind: "denied", reviewText: "I couldn’t apply that review. Ask to see your current suggestions." }, 403);
