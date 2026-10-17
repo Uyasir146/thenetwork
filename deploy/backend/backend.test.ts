@@ -249,7 +249,8 @@ describe("routing", () => {
   test("the Eliza gateway's signed routes reach the service on the public port, /internal/relay included (it was 404), each under its own body cap", async () => {
     const { svc, calls } = fakeService();
     const b = createBackend({ svc, config: cfg(), log: silent, ping: async () => true });
-    for (const p of ["/internal/turn", "/internal/turn-receipt", "/internal/set-state", "/internal/signals", "/internal/updates", "/internal/relay"]) {
+    for (const p of ["/internal/turn", "/internal/turn-receipt", "/internal/set-state", "/internal/signals", "/internal/updates", "/internal/relay",
+      "/internal/profile-suggestions/preview", "/internal/profile-suggestions/decide", "/internal/profile-suggestions/delete"]) {
       const r = await b.publicFetch(new Request(`http://api.example.test${p}`, { method: "POST", body: "{}", headers: { "content-type": "application/json" } }));
       expect([p, r.status]).toEqual([p, 200]);
       expect(calls.at(-1)).toMatchObject({ kind: "staff", path: p });
@@ -261,6 +262,7 @@ describe("routing", () => {
     expect(calls.length).toBe(n);
     // The same size is fine on the turn route (256 KiB).
     expect((await b.publicFetch(new Request("http://api.example.test/internal/turn", { method: "POST", body: "x".repeat(17 * 1024), headers: { "content-length": String(17 * 1024) } }))).status).toBe(200);
+    expect((await b.publicFetch(new Request("http://api.example.test/internal/profile-suggestions/decide", { method: "POST", body: "x".repeat(17 * 1024), headers: { "content-length": String(17 * 1024) } }))).status).toBe(413);
   });
 
   test("deployed, an unsigned request names no site: /api and /mcp answer 421 (audit: Host: slop.date was served as slop.date)", async () => {

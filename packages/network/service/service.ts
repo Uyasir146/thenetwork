@@ -33,6 +33,7 @@ import { isMinor } from "@thenetwork/core";
 import { ageAnswer, agesStated } from "../src/classify.ts";
 import { NetworkRuntime, type RuntimeHost } from "./runtime.ts";
 import { effectiveParticipation } from "./snapshot.ts";
+import { ProfileSuggestions, type SuggestionAuthorization } from "./profile-suggestions.ts";
 import { Inbox, type CollectedReply } from "./inbox.ts";
 import { networkRoutePolicy, routeEnvelopeAllowed, sameNetworkAuthority, type NetworkRoutePolicy } from "./route-authority.ts";
 import { TURN_PATH, TURN_RECEIPT_PATH, SET_STATE_PATH, SIGNALS_PATH, UPDATES_PATH, type SetStateRequest, type TurnRequest, type TurnResponse } from "../../core/src/svc/contract.ts";
@@ -64,6 +65,7 @@ import { normalizeAddress } from "../../blooio/src/phone.ts";
 import { resolveTimeZone } from "../../blooio/src/quiet-hours.ts";
 import { Notifier, type InboxItem, type NotifyStore, type OutboundSink, type Recipient, type Surface } from "../../notify/src/index.ts";
 import { PgNotifyStore } from "../../notify/src/pg-store.ts";
+import { SUGGESTION_PATH, profileSuggestionEndpoint, type SuggestionIdentityResolver } from "./profile-suggestion-endpoint.ts";
 import { RELAY_PATH, relayClassifierFromEnv, relayEndpoint } from "./relay-endpoint.ts";
 import type { RelayClassifierHook } from "../../engine/src/relay.ts";
 import type { ChannelEvent } from "../../blooio/src/types.ts";
@@ -131,6 +133,9 @@ const MAX_REVIEW_SECONDS = 3600;
 export interface NetworkSpec { id: string; matchingEnabled?: boolean }
 
 export interface ServiceOptions {
+  /** Optional trusted source-consent check; imports and promotions default to denied. */
+  profileSuggestionIdentity?: SuggestionIdentityResolver;
+  profileSuggestionAuthorization?: SuggestionAuthorization;
   /** Postgres with the `network` and `platform` schemas (a login that can read and write them). */
   url: string;
   /** The networks to run (platform.networks rows; NetworkService.fromDatabase reads them). Default: one, `id`. */
@@ -249,6 +254,9 @@ class RouteAuthorityExpiredError extends Error {}
 
 export class NetworkService implements RuntimeHost {
   readonly sql: SQL;
+  readonly profileSuggestions: ProfileSuggestions;
+  private readonly suggestionIdentity?: SuggestionIdentityResolver;
+  private readonly suggestionAuthorization?: SuggestionAuthorization;
   readonly clock: Clock;
   readonly instance: string;
   readonly audit: AuditSink;
@@ -323,6 +331,9 @@ export class NetworkService implements RuntimeHost {
     const specs = o.networks?.length ? o.networks : [{ id: o.id ?? "ntwrk:nyc" }];
     // Each network's tick holds one connection for its advisory lock and needs more inside it: size the pool from the network count.
     this.sql = new SQL({ url: o.url, max: Math.max(8, 2 * specs.length + 4), connection: { application_name: `network-service:${this.instance}` } });
+    this.suggestionIdentity = o.profileSuggestionIdentity;
+    this.suggestionAuthorization = o.profileSuggestionAuthorization;
+    this.profileSuggestions = new ProfileSuggestions(this.sql, o.profileSuggestionAuthorization ?? (async () => false));
     this.people = o.people ?? new PgPeopleStore(this.sql);
     this.cost = new CostLedger({ sink: new PgCostSink(this.sql), clock: this.clock, rates: costRatesFromEnv(this.env), log: this.log });
     // Opt-in only. One process-wide budget covers all apps and provider retries.
@@ -484,6 +495,9 @@ export class NetworkService implements RuntimeHost {
 
   /** Retention (audit platform-18): expired OTP challenges and sessions, old rate windows and stale text flows. */
   async purge() {
+    for (const app of new Set([...this.runtimes.values()].map(rt => rt.app.id))) {
+      await this.profileSuggestions.expirePending(app, this.clock.now()).catch(e => this.log(`[purge] profile suggestions failed: ${(e as Error).message}`));
+    }
     const n = await this.people.purge(this.clock.now() - 2 * DAY).catch(e => { this.log(`[purge] failed: ${(e as Error).message}`); return 0; });
     // The inbox keeps handled ids a week (dedupe); the line keeps no counters for an address that is nobody's phone.
     await this.inbox.purge(this.clock.now() - 7 * DAY).catch(e => this.log(`[purge] inbox failed: ${(e as Error).message}`));
@@ -1990,6 +2004,7 @@ export class NetworkService implements RuntimeHost {
   /** The HTTP handler: the inbound webhooks and the staff API. The public API is publicFetch (its own port). */
   fetch = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
+    if (url.pathname.startsWith(SUGGESTION_PATH)) return profileSuggestionEndpoint({ sql: this.sql, now: () => this.clock.now(), secret: this.env.SERVICE_TURN_SECRET, routePolicy: this.routePolicy, resolveIdentity: this.suggestionIdentity, authorizeSource: this.suggestionAuthorization }, req);
     if ([TURN_PATH, TURN_RECEIPT_PATH, SET_STATE_PATH, SIGNALS_PATH, UPDATES_PATH].includes(url.pathname)) return this.sharedTurn(req);
     if (url.pathname === RELAY_PATH) return relayEndpoint({ sql: this.sql, clock: this.clock, secret: this.env.SERVICE_TURN_SECRET, routePolicy: this.routePolicy, accounts: this.accounts, runtimeFor: app => this.runtimeFor(app), runtimeOfMember: (app, memberId) => this.runtimeOfMember(app, memberId), ...(this.relayHookFor ? { hookFor: this.relayHookFor } : {}) }, req);
     let path = url.pathname.replace(/\/+$/, "") || "/";
