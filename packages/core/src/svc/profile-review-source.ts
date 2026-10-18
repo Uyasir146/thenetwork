@@ -27,6 +27,7 @@ export interface ProfileReviewSourceProof {
   chatId: string;
   issuedAt: number;
   expiresAt: number;
+  pendingExpiresAt: number;
 }
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -55,12 +56,13 @@ export function parseProfileReviewSourceRequest(value: unknown): ProfileReviewSo
 export function parseProfileReviewSourceProof(value: unknown, request: ProfileReviewSourceRequest, requestSha256: string, now: number): ProfileReviewSourceProof | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const v = value as Record<string, unknown>;
-  if (Object.keys(v).sort().join() !== "app,chatId,expiresAt,issuedAt,organizationId,personId,purpose,requestNonce,requestSha256,userId,version"
+  if (Object.keys(v).sort().join() !== "app,chatId,expiresAt,issuedAt,organizationId,pendingExpiresAt,personId,purpose,requestNonce,requestSha256,userId,version"
     || v.version !== 1 || v.purpose !== "network-profile-learning-source-v1"
     || !/^[a-f0-9]{64}$/.test(requestSha256) || v.requestSha256 !== requestSha256
     || v.requestNonce !== request.review.requestNonce || v.personId !== request.personId || v.app !== request.review.app
     || typeof v.userId !== "string" || !uuid.test(v.userId) || typeof v.organizationId !== "string" || !uuid.test(v.organizationId)
     || typeof v.chatId !== "string" || !/^personal:[0-9a-f-]{36}$/i.test(v.chatId)
+    || !Number.isSafeInteger(v.pendingExpiresAt) || (v.pendingExpiresAt as number) < (v.expiresAt as number)
     || !Number.isSafeInteger(now) || !Number.isSafeInteger(v.issuedAt) || !Number.isSafeInteger(v.expiresAt)
     || (v.issuedAt as number) > now || (v.expiresAt as number) <= now
     || (v.expiresAt as number) <= (v.issuedAt as number) || (v.expiresAt as number) - (v.issuedAt as number) > 5_000) return undefined;

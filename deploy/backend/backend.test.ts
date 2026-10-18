@@ -250,7 +250,7 @@ describe("routing", () => {
     const { svc, calls } = fakeService();
     const b = createBackend({ svc, config: cfg(), log: silent, ping: async () => true });
     for (const p of ["/internal/turn", "/internal/turn-receipt", "/internal/set-state", "/internal/signals", "/internal/updates", "/internal/relay",
-      "/internal/profile-suggestions/preview", "/internal/profile-suggestions/decide", "/internal/profile-suggestions/delete"]) {
+      "/internal/profile-suggestions/preview", "/internal/profile-suggestions/decide", "/internal/profile-suggestions/delete", "/internal/profile-suggestions/collect"]) {
       const r = await b.publicFetch(new Request(`http://api.example.test${p}`, { method: "POST", body: "{}", headers: { "content-type": "application/json" } }));
       expect([p, r.status]).toEqual([p, 200]);
       expect(calls.at(-1)).toMatchObject({ kind: "staff", path: p });

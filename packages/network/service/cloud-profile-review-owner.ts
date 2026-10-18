@@ -41,7 +41,7 @@ export function cloudProfileReviewOwner(o: CloudProfileReviewOwnerOptions): Sugg
         || typeof turn.body !== "string" || sha256(turn.body) !== context.commandSha256) return null;
       // This narrows dispatch only; the canonical review parser still owns the exact decision.
       const command = turn.body.trim();
-      if (context.action === "preview" || context.action === "delete") {
+      if (context.action === "preview" || context.action === "delete" || context.action === "collect") {
         if (command !== `${context.action} ${context.batchId}`) return null;
       } else if (!["accept", "reject", "edit"].some(verb => command.startsWith(`${verb} ${context.batchId}.`))) return null;
       const arrivedAt = new Date(turn.arrived_at).getTime();

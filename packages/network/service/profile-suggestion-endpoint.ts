@@ -5,7 +5,7 @@ import type { AppId } from "../../platform/src/apps.ts";
 import { isAppId } from "../../platform/src/apps.ts";
 import { readCapped } from "../../platform/src/body.ts";
 import { svcVerify } from "../../core/src/svc/svc-auth.ts";
-import { ProfileSuggestions, type SuggestionAuthorization, type SuggestionOwner, type SuggestionReviewBatch } from "./profile-suggestions.ts";
+import { ProfileSuggestions, type SuggestionAuthorization, type SuggestionOwner, type SuggestionReviewBatch, type SuggestionProposal } from "./profile-suggestions.ts";
 import { renderSuggestionReview, reviewSuggestionMessage } from "./profile-suggestion-review.ts";
 import { routeEnvelopeAllowed, type NetworkRoutePolicy } from "./route-authority.ts";
 
@@ -16,8 +16,10 @@ export type SuggestionReviewResponse =
   | { kind: "deleted" | "denied"; reviewText: string };
 export interface SuggestionTurnIdentity {
   personId: string; memberId: string; app: AppId; channel: "blooio" | "twilio"; messageId: string;
-  action: "preview" | "decide" | "delete"; batchId: string; commandSha256: string;
+  action: "preview" | "decide" | "delete" | "collect"; batchId: string; commandSha256: string;
   networkAuthority?: NetworkRouteAuthorityV1;
+  /** Requested retention deadline derived from the validated collection proposal. */
+  pendingExpiresAt?: number;
 }
 /** Cloud supplies its existing trusted binding lookup, never model-provided identity fields.
  * It must recheck the current user/org/chat binding and revocation using this transaction.
@@ -40,7 +42,7 @@ const uuid = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{8}
 /** Internal-only review wire. Every store transaction rechecks the canonical turn and Cloud binding. */
 export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: Request): Promise<Response> {
   const url = new URL(req.url), action = url.pathname.slice(SUGGESTION_PATH.length);
-  if (!["preview", "decide", "delete"].includes(action)) return json({ error: "not_found" }, 404);
+  if (!["preview", "decide", "delete", "collect"].includes(action)) return json({ error: "not_found" }, 404);
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
   if (url.search) return json({ error: "invalid_request" }, 400);
   const bytes = await readCapped(req, 16 * 1024);
@@ -53,10 +55,12 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
   if (!d.resolveIdentity) return json({ error: "identity_unavailable" }, 503);
   let b: Record<string, unknown>;
   try { b = JSON.parse(raw); } catch { return json({ error: "invalid_request" }, 400); }
-  const keys = ["channel", "messageId", "batchId", ...(action === "preview" ? [] : ["text"]), ...(b?.networkAuthority === undefined ? [] : ["networkAuthority"])];
+  const keys = ["channel", "messageId", "batchId", ...(action === "preview" ? [] : ["text"]), ...(action === "collect" ? ["proposal"] : []), ...(b?.networkAuthority === undefined ? [] : ["networkAuthority"])];
   if (!b || typeof b !== "object" || Array.isArray(b) || Object.keys(b).length !== keys.length || Object.keys(b).some(k => !keys.includes(k))
     || (b.channel !== "blooio" && b.channel !== "twilio") || !validId(b.messageId, 512) || !uuid(b.batchId)
     || auth.id !== `${b.messageId}:suggestions:${action}` || (action !== "preview" && !validId(b.text, 2000))) return json({ error: "invalid_request" }, 400);
+  const proposal = action === "collect" ? parseCollectionProposal(b.proposal) : undefined;
+  if (action === "collect" && (!proposal || b.text !== `collect ${b.batchId}`)) return json({ error: "invalid_collection" }, 400);
   const channel = b.channel, messageId = b.messageId, batchId = b.batchId;
   let proofValidUntil: number | undefined;
   let proofValid: (() => boolean) | undefined;
@@ -78,6 +82,7 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
     const binding = await d.resolveIdentity!({ personId: person.id, memberId, app, channel, messageId,
       action: action as SuggestionTurnIdentity["action"], batchId,
       commandSha256: createHash("sha256").update(message.body).digest("hex"),
+      ...(proposal ? { pendingExpiresAt: proposal.expiresAt } : {}),
       ...(networkAuthority ? { networkAuthority } : {}) }, tx);
     if (!binding || !validId(binding.userId, 256) || !validId(binding.organizationId, 256) || !validId(binding.chatId, 256)) return null;
     if (binding.validUntil !== undefined && (!Number.isSafeInteger(binding.validUntil) || binding.validUntil <= d.now())) return null;
@@ -95,6 +100,13 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
       && (!proofValid || proofValid())
       && routeEnvelopeAllowed(d.routePolicy, b.networkAuthority, d.now())
       && (!d.routePolicy || d.now() < d.routePolicy.admitUntil) });
+    if (action === "collect") {
+      const batch = await store.propose(owner, proposal!, d.now(), { batchId, turnId: `msg:${channel}:${messageId}`,
+        requestSha256: createHash("sha256").update(raw).digest("hex") });
+      const reviewText = batch && renderSuggestionReview(batch, owner, d.now());
+      return batch && reviewText ? json({ kind: "preview", batch, reviewText })
+        : json({ kind: "denied", reviewText: "I couldn’t collect those suggestions. Nothing new was saved." }, 403);
+    }
     if (action === "delete") {
       if (b.text !== `delete ${batchId}`) return json({ error: "invalid_command" }, 400);
       return await store.deleteBatch(owner, batchId) ? json({ kind: "deleted", reviewText: "Deleted these suggestions and their linked saved facts." }) : json({ kind: "denied", reviewText: "I couldn’t apply that review. Ask to see your current suggestions." }, 403);
@@ -113,4 +125,27 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
     // No source text, connection details, or database error crosses the internal wire.
     return json({ error: "review_unavailable" }, 503);
   }
+}
+
+/** The internal collection wire accepts only bounded minimal suggestions, never raw source objects. */
+function parseCollectionProposal(value: unknown): SuggestionProposal | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const p = value as Record<string, unknown>;
+  const keys = ["windowStart", "windowEnd", "timezone", "expiresAt", "retainOnDisconnect", "allowedKinds", "suggestions"];
+  if (Object.keys(p).length !== keys.length || Object.keys(p).some(k => !keys.includes(k))
+    || ![p.windowStart, p.windowEnd, p.expiresAt].every(Number.isSafeInteger) || typeof p.timezone !== "string"
+    || p.timezone.length > 100 || typeof p.retainOnDisconnect !== "boolean" || !Array.isArray(p.allowedKinds)
+    || !p.allowedKinds.length || p.allowedKinds.length > 3 || new Set(p.allowedKinds).size !== p.allowedKinds.length
+    || p.allowedKinds.some(k => !["interest", "goal", "availability_pattern"].includes(k))
+    || !Array.isArray(p.suggestions) || !p.suggestions.length || p.suggestions.length > 10) return undefined;
+  const suggestionKeys = ["connectionId", "source", "observedAt", "kind", "value", "tags", "confidence", "scope"];
+  for (const v of p.suggestions) {
+    if (!v || typeof v !== "object" || Array.isArray(v) || Object.keys(v).length !== suggestionKeys.length
+      || Object.keys(v).some(k => !suggestionKeys.includes(k)) || !uuid(v.connectionId)
+      || !["gmail", "google_calendar"].includes(v.source) || !Number.isSafeInteger(v.observedAt)
+      || !p.allowedKinds.includes(v.kind) || typeof v.value !== "string" || v.value.length > 400 || /[\u0000-\u001f\u007f]/u.test(v.value)
+      || !Array.isArray(v.tags) || v.tags.some((t: unknown) => typeof t !== "string") || v.tags.length > 12
+      || typeof v.confidence !== "number" || !Number.isFinite(v.confidence) || !["agent_private", "matchable"].includes(v.scope)) return undefined;
+  }
+  return value as SuggestionProposal;
 }

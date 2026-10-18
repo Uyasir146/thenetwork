@@ -41,7 +41,7 @@ export function profileReviewFactory(o: CloudProfileReviewOwnerOptions): Profile
     profileSuggestionAuthorization: async (owner, consent, tx) => {
       try {
         const entry = transactions.get(tx);
-        if (!entry || !current(entry, tx) || entry.turn.action !== "decide"
+        if (!entry || !current(entry, tx) || !["decide", "collect"].includes(entry.turn.action)
           || Object.entries(entry.owner).some(([key, value]) => owner[key as keyof SuggestionOwner] !== value)) return false;
         const review = parseProfileReviewOwnerRequest({ version: 1, channel: entry.turn.channel, messageId: entry.turn.messageId,
           app: entry.turn.app, memberId: entry.turn.memberId, batchId: entry.turn.batchId, action: entry.turn.action,
@@ -52,7 +52,9 @@ export function profileReviewFactory(o: CloudProfileReviewOwnerOptions): Profile
         if (!result || !current(entry, tx)) return false;
         const proof = parseProfileReviewSourceProof(result.value, request, result.selectorSha256, result.now);
         if (!proof || proof.userId !== owner.userId || proof.organizationId !== owner.organizationId || proof.chatId !== owner.chatId
-          || proof.personId !== owner.personId || proof.app !== owner.app || proof.expiresAt > o.routePolicy.admitUntil) return false;
+          || proof.personId !== owner.personId || proof.app !== owner.app || proof.expiresAt > o.routePolicy.admitUntil
+          || (entry.turn.action === "collect" && (!Number.isSafeInteger(entry.turn.pendingExpiresAt)
+            || entry.turn.pendingExpiresAt! > proof.pendingExpiresAt || entry.turn.pendingExpiresAt! <= o.now()))) return false;
         entry.sourceUntil = Math.min(entry.sourceUntil, proof.expiresAt);
         return current(entry, tx);
       } catch { return false; }

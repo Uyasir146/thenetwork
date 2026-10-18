@@ -33,6 +33,7 @@ export interface SuggestionCollectionClaim { batchId: string; turnId: string; re
 const sensitive = (s: string) => (fold(s).match(/\p{L}+/gu) ?? []).some(isSensitiveTerm);
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const valueOK = (s: unknown): s is string => typeof s === "string" && s.trim().length >= 2 && s.length <= 400
+  && !/[\u0000-\u001f\u007f]/u.test(s)
   && !/(?:https?:\/\/|\b[^\s@]+@[^\s@]+\.[^\s@]+|\+?\d[\d ().-]{7,}\d)/u.test(s)
   && !sensitive(s);
 

@@ -8,7 +8,7 @@ export interface ProfileReviewOwnerRequest {
   app: "ntwrk" | "slop" | "friends" | "peon";
   memberId: string;
   batchId: string;
-  action: "preview" | "decide" | "delete";
+  action: "preview" | "decide" | "delete" | "collect";
   commandSha256: string;
   networkAuthority: NetworkRouteAuthorityV1;
   requestNonce: string;
@@ -30,7 +30,7 @@ function requestFields(v: Record<string, unknown>): boolean {
     && typeof v.messageId === "string" && /^[A-Za-z0-9_:.\-]{1,200}$/.test(v.messageId)
     && ["ntwrk", "slop", "friends", "peon"].includes(String(v.app))
     && typeof v.memberId === "string" && /^[A-Za-z0-9_:\-]{1,128}$/.test(v.memberId)
-    && uuid(v.batchId) && ["preview", "decide", "delete"].includes(String(v.action))
+    && uuid(v.batchId) && ["preview", "decide", "delete", "collect"].includes(String(v.action))
     && digest(v.commandSha256) && !!parseNetworkRouteAuthorityV1(v.networkAuthority) && uuid(v.requestNonce);
 }
 export function parseProfileReviewOwnerRequest(value: unknown): ProfileReviewOwnerRequest | undefined {

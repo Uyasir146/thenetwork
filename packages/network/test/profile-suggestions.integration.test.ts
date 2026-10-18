@@ -133,7 +133,7 @@ test("deleting a batch and leaving the app remove only linked derived facts", as
 });
 
 test("no default data window, retention choice, contact details or sensitive inference is accepted", async () => {
-  for (const value of ["email alex@example.test", "phone +12125550100", "health cancer", "https://example.test/private"]) {
+  for (const value of ["email alex@example.test", "phone +12125550100", "health cancer", "https://example.test/private", "I enjoy\nclimbing", "I enjoy\u0000climbing"]) {
     expect(await store.propose(owner, input([{ ...candidate(), value }]), now)).toBeNull();
   }
   expect(await store.propose(owner, { ...input(), windowStart: -Infinity }, now)).toBeNull();
@@ -399,7 +399,7 @@ async function ownerProofFixture() {
       expect(auth.id).toBe(`${request.review.messageId}:suggestions:source:${request.review.requestNonce}`);
       if (!sourceAllowed(request)) return new Response(null, { status: 403 });
       const proof: Record<string, unknown> = { version: 1, purpose: "network-profile-learning-source-v1", requestSha256: digest(raw),
-        requestNonce: request.review.requestNonce, ...identity, personId: request.personId, app: request.review.app, issuedAt: now, expiresAt: now + 5000 };
+        requestNonce: request.review.requestNonce, ...identity, personId: request.personId, app: request.review.app, issuedAt: now, expiresAt: now + 5000, pendingExpiresAt: now + 60_000 };
       alterSource(proof);
       const body = JSON.stringify(proof);
       return new Response(body, { headers: await svcSign(httpSecret, { method: "POST", path, id: `${auth.id}:proof`, body, nowS: Math.floor(now / 1000) }) });
@@ -770,4 +770,61 @@ test("collection replay retains its source deadline instead of rebinding owner a
   expect((await guarded.propose(owner, input(), now, claim))?.id).toBe(batchId);
   expect(ownerReads).toBe(1);
   expect(sourceRead).toBe(true);
+});
+
+test("internal collect joins canonical signed owner/source proofs to one pending batch and preserves replay and deletion", async () => {
+  const f = await ownerProofFixture();
+  const batchId = randomUUID(), connectionId = randomUUID();
+  const proposal = input([{ ...candidate(), connectionId }]);
+  const text = `collect ${batchId}`;
+  const callbacks = profileReviewFactory(f.options);
+  const http = await reviewHttp(callbacks.profileSuggestionIdentity, callbacks.profileSuggestionAuthorization, f.policy);
+  try {
+    await reviewCommandTurn(f, "http-collect", text);
+    const args = { text, proposal, networkAuthority: f.policy.authority };
+    expect((await http.post("collect", "http-collect", batchId, args)).status).toBe(403);
+    expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(0);
+    f.setSourceAllowed(r => r.review.action === "collect" && r.personId === owner.personId && r.consent.connectionId === connectionId
+      && r.consent.windowStart === proposal.windowStart && r.consent.windowEnd === proposal.windowEnd && !r.consent.retainOnDisconnect);
+    f.setSourceAlter(proof => { proof.pendingExpiresAt = now + 59_999; });
+    expect((await http.post("collect", "http-collect", batchId, args)).status).toBe(403);
+    expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(0);
+    f.setSourceAlter(() => {});
+    const results = await Promise.all([http.post("collect", "http-collect", batchId, args), http.post("collect", "http-collect", batchId, args)]);
+    expect(results[0].status).toBe(200);
+    expect(results[1].body.batch).toEqual(results[0].body.batch);
+    expect(results[0].body.reviewText).toContain("nothing saved yet");
+    expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(1);
+    expect(await sql`select id from platform.profile_suggestions`).toHaveLength(1);
+    expect(await facets()).toHaveLength(0);
+    expect((await http.post("collect", "http-collect", batchId, { ...args, proposal: { ...proposal, suggestions: [{ ...proposal.suggestions[0], value: "I enjoy hiking" }] } })).status).toBe(403);
+    f.setSourceAllowed(() => false);
+    expect((await http.post("collect", "http-collect", batchId, args)).status).toBe(403);
+    await reviewCommandTurn(f, "delete-collected", `delete ${batchId}`);
+    expect((await http.post("delete", "delete-collected", batchId, { text: `delete ${batchId}`, networkAuthority: f.policy.authority })).body.kind).toBe("deleted");
+    f.setSourceAllowed(() => true);
+    expect((await http.post("collect", "http-collect", batchId, args)).status).toBe(403);
+    expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(0);
+    expect(await facets()).toHaveLength(0);
+  } finally { await http.stop(); f.stop(); }
+});
+
+test("collect wire rejects raw source payloads, foreign identities, fake commands and malformed scope before import", async () => {
+  const f = await ownerProofFixture();
+  const batchId = randomUUID();
+  const callbacks = profileReviewFactory(f.options);
+  const http = await reviewHttp(callbacks.profileSuggestionIdentity, callbacks.profileSuggestionAuthorization, f.policy);
+  try {
+    await reviewCommandTurn(f, "wire-collect", `collect ${batchId}`);
+    const args = { text: `collect ${batchId}`, proposal: input([{ ...candidate(), connectionId: randomUUID() }]), networkAuthority: f.policy.authority };
+    for (const extra of [{ userId: randomUUID() }, { proposal: null }, { proposal: { ...args.proposal, rawMailBody: "private mail" } },
+      { proposal: { ...args.proposal, suggestions: [{ ...args.proposal.suggestions[0], rawEvent: {} }] } },
+      { proposal: { ...args.proposal, allowedKinds: ["interest", "interest"] } },
+      { proposal: { ...args.proposal, suggestions: [{ ...args.proposal.suggestions[0], value: "I enjoy\nclimbing" }] } }, { text: `collect ${batchId}.1` }])
+      expect((await http.post("collect", "wire-collect", batchId, { ...args, ...extra })).status).toBe(400);
+    await sql`update network.messages set body='ordinary message' where id='in:blooio:wire-collect'`;
+    expect((await http.post("collect", "wire-collect", batchId, args)).status).toBe(403);
+    expect(f.sourceCalls).toBe(0);
+    expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(0);
+  } finally { await http.stop(); f.stop(); }
 });

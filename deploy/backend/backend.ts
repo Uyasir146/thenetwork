@@ -37,7 +37,7 @@ const STRIP = ["x-forwarded-host", "x-forwarded-for", "x-forwarded-proto", "x-re
 const PROXY_PREFIXES = ["x-network-proxy-", "x-ntwrk-proxy-"];
 /** The Eliza gateway's signed routes (served by the service) and their body cap (the service's MAX_BODY_BYTES). */
 const INTERNAL_PATHS = new Set(["/internal/turn", "/internal/turn-receipt", "/internal/set-state", "/internal/signals", "/internal/updates", "/internal/relay",
-  ...["preview", "decide", "delete"].map(action => SUGGESTION_PATH + action)]);
+  ...["preview", "decide", "delete", "collect"].map(action => SUGGESTION_PATH + action)]);
 const MAX_INTERNAL_BODY = 256 * 1024;
 const internalCap = (path: string) => (path === RELAY_PATH || path.startsWith(SUGGESTION_PATH) ? RELAY_MAX_BODY_BYTES : MAX_INTERNAL_BODY);
 
