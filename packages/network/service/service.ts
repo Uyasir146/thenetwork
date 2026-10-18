@@ -66,6 +66,8 @@ import { normalizeAddress } from "../../blooio/src/phone.ts";
 import { resolveTimeZone } from "../../blooio/src/quiet-hours.ts";
 import { Notifier, type InboxItem, type NotifyStore, type OutboundSink, type Recipient, type Surface } from "../../notify/src/index.ts";
 import { PgNotifyStore } from "../../notify/src/pg-store.ts";
+import { LEARNING_CONSENT_CONTEXT_PATH } from "../../core/src/svc/learning-consent-context.ts";
+import { learningConsentContextEndpoint } from "./learning-consent-context-endpoint.ts";
 import { SUGGESTION_PATH, profileSuggestionEndpoint, type SuggestionIdentityResolver } from "./profile-suggestion-endpoint.ts";
 import { RELAY_PATH, relayClassifierFromEnv, relayEndpoint } from "./relay-endpoint.ts";
 import type { RelayClassifierHook } from "../../engine/src/relay.ts";
@@ -2006,6 +2008,7 @@ export class NetworkService implements RuntimeHost {
   /** The HTTP handler: the inbound webhooks and the staff API. The public API is publicFetch (its own port). */
   fetch = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
+    if (url.pathname === LEARNING_CONSENT_CONTEXT_PATH) return learningConsentContextEndpoint({ sql: this.sql, now: () => this.clock.now(), secret: this.env.SERVICE_TURN_SECRET, routePolicy: this.routePolicy }, req);
     if (url.pathname.startsWith(SUGGESTION_PATH)) return profileSuggestionEndpoint({ sql: this.sql, now: () => this.clock.now(), secret: this.env.SERVICE_TURN_SECRET, routePolicy: this.routePolicy, resolveIdentity: this.suggestionIdentity, authorizeSource: this.suggestionAuthorization }, req);
     if ([TURN_PATH, TURN_RECEIPT_PATH, SET_STATE_PATH, SIGNALS_PATH, UPDATES_PATH].includes(url.pathname)) return this.sharedTurn(req);
     if (url.pathname === RELAY_PATH) return relayEndpoint({ sql: this.sql, clock: this.clock, secret: this.env.SERVICE_TURN_SECRET, routePolicy: this.routePolicy, accounts: this.accounts, runtimeFor: app => this.runtimeFor(app), runtimeOfMember: (app, memberId) => this.runtimeOfMember(app, memberId), ...(this.relayHookFor ? { hookFor: this.relayHookFor } : {}) }, req);

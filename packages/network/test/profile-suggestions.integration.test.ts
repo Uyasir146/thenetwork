@@ -15,6 +15,7 @@ import { PROFILE_REVIEW_OWNER_PATH, parseProfileReviewOwnerRequest } from "../..
 import { PROFILE_REVIEW_SOURCE_PATH, parseProfileReviewSourceRequest, type ProfileReviewSourceRequest } from "../../core/src/svc/profile-review-source.ts";
 import { profileReviewFactory, profileReviewFromEnv } from "../service/profile-review-factory.ts";
 import type { NetworkRoutePolicy } from "../service/route-authority.ts";
+import { LEARNING_CONSENT_CONTEXT_PATH, parseLearningConsentContextProof, type LearningConsentContextRequest } from "../../core/src/svc/learning-consent-context.ts";
 
 const now = Date.UTC(2026, 9, 17, 12);
 const db = `profile_suggestions_${process.pid}`;
@@ -266,6 +267,14 @@ async function reviewHttp(resolveIdentity?: SuggestionIdentityResolver, authoriz
     profileSuggestionAuthorization: bootstrapEnv ? undefined : authorizeSource ?? (async () => active) });
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: service.fetch });
   return { clock, service, async stop() { server.stop(true); await service.close(); },
+    async context(input: LearningConsentContextRequest, changes?: { unsigned?: boolean; extra?: Record<string, unknown>; path?: string }) {
+      const body = JSON.stringify({ ...input, ...changes?.extra });
+      const path = changes?.path ?? LEARNING_CONSENT_CONTEXT_PATH;
+      const headers = changes?.unsigned ? {} : await svcSign(httpSecret, { method: "POST", path, id: `${input.review.messageId}:learning-consent:${input.review.requestNonce}`, body, nowS: Math.floor(clock.now() / 1000) });
+      const response = await fetch(new URL(LEARNING_CONSENT_CONTEXT_PATH, server.url), { method: "POST", body, headers });
+      const raw = await response.text();
+      return { status: response.status, raw, headers: response.headers, body: JSON.parse(raw), requestRaw: body };
+    },
     async post(action: string, messageId: string, batchId: string, extra: Record<string, unknown> = {}, signedPath?: string) {
       const path = SUGGESTION_PATH + action;
       const body = JSON.stringify({ channel: "blooio", messageId, batchId, ...extra });
@@ -827,4 +836,94 @@ test("collect wire rejects raw source payloads, foreign identities, fake command
     expect(f.sourceCalls).toBe(0);
     expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(0);
   } finally { await http.stop(); f.stop(); }
+});
+
+async function contextFixture() {
+  const f = await ownerProofFixture();
+  const batchId = randomUUID();
+  await reviewCommandTurn(f, "consent-identity", `collect ${batchId}`);
+  await sql`insert into platform.phone_identities(e164,person_id,verified_at,method) values('+12125550100',${owner.personId},${new Date(now)},'inbound_message')`;
+  const input: LearningConsentContextRequest = { version: 1, purpose: 'network_profile_learning_v1', selectionSha256: digest('exact displayed selection'),
+    review: { version: 1, channel: 'blooio', messageId: 'consent-identity', app: 'ntwrk', memberId: 'owned-member', batchId,
+      action: 'collect', commandSha256: digest(`collect ${batchId}`), networkAuthority: f.policy.authority, requestNonce: randomUUID() } };
+  const http = await reviewHttp(undefined, undefined, f.policy);
+  return { f, http, input, async stop() { await http.stop(); f.stop(); } };
+}
+
+test("membership context derives and signs only the current Network person without consent or Cloud identity inputs", async () => {
+  const t = await contextFixture();
+  try {
+    const r = await t.http.context(t.input);
+    expect(r.status).toBe(200);
+    expect(r.headers.get('cache-control')).toBe('no-store');
+    expect(await svcVerify(httpSecret, { method: 'POST', path: LEARNING_CONSENT_CONTEXT_PATH, headers: r.headers, body: r.raw, nowS: Math.floor(now/1000) }))
+      .toMatchObject({ ok: true, id: `${t.input.review.messageId}:learning-consent:${t.input.review.requestNonce}:proof` });
+    expect(parseLearningConsentContextProof(r.body, t.input, digest(r.requestRaw), now)).toMatchObject({ personId: owner.personId, app: owner.app, memberId: 'owned-member', expiresAt: now+30_000 });
+    expect(r.raw).not.toContain('+12125550100');
+    expect(r.body).not.toHaveProperty('userId');
+    expect(r.body).not.toHaveProperty('organizationId');
+    expect(r.body).not.toHaveProperty('chatId');
+    expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(0);
+    expect(await facets()).toHaveLength(0);
+    // Repeating a read does not consume or manufacture consent; each proof is bound to its exact nonce/selection.
+    const second = await t.http.context({ ...t.input, review: { ...t.input.review, requestNonce: randomUUID() } });
+    expect(second.status).toBe(200);
+    expect(parseLearningConsentContextProof(second.body, t.input, digest(r.requestRaw), now)).toBeUndefined();
+    expect(parseLearningConsentContextProof(r.body, { ...t.input, selectionSha256: digest('other selection') }, digest(r.requestRaw), now)).toBeUndefined();
+  } finally { await t.stop(); }
+});
+
+test("membership context denies unsigned, caller-person, foreign-app/member/turn and fake command requests", async () => {
+  const t = await contextFixture();
+  try {
+    expect((await t.http.context(t.input, { unsigned: true })).status).toBe(401);
+    expect((await t.http.context(t.input, { extra: { personId: randomUUID() } })).status).toBe(400);
+    for (const wrong of [{ app: 'friends' as const }, { memberId: 'foreign-member' }, { messageId: 'missing' }, { batchId: randomUUID() },
+      { commandSha256: digest('model text') }, { networkAuthority: { ...t.f.policy.authority, generation: 'foreign' } }])
+      expect((await t.http.context({ ...t.input, review: { ...t.input.review, ...wrong } })).status).toBe(403);
+    await sql`update platform.inbound set sender_hash='foreign-person-hash' where id='msg:blooio:consent-identity'`;
+    expect((await t.http.context(t.input)).status).toBe(403);
+  } finally { await t.stop(); }
+});
+
+test("membership context revocation, STOP, stale parent and route expiry deny fresh proofs", async () => {
+  const t = await contextFixture();
+  try {
+    await sql`update platform.inbound set arrived_at=${new Date(now-300_000)} where id='msg:blooio:consent-identity'`;
+    expect((await t.http.context(t.input)).status).toBe(403);
+    await sql`update platform.inbound set arrived_at=${new Date(now+1)} where id='msg:blooio:consent-identity'`;
+    expect((await t.http.context(t.input)).status).toBe(403);
+    await sql`update platform.inbound set arrived_at=${new Date(now)} where id='msg:blooio:consent-identity'`;
+    await sql`insert into platform.consent_events(e164,app_id,state,source,at) values('+12125550100',null,'opted_out','fixture',${new Date(now)})`;
+    expect((await t.http.context(t.input)).status).toBe(403);
+    await sql`delete from platform.consent_events`;
+    await sql`insert into platform.phone_identities(e164,person_id,verified_at,method) values('+12125550101',${owner.personId},${new Date(now+1)},'inbound_message')`;
+    expect((await t.http.context(t.input)).status).toBe(403);
+    await sql`delete from platform.phone_identities where e164='+12125550101'`;
+    await sql`update platform.memberships set state='removed' where person_id=${owner.personId}`;
+    expect((await t.http.context(t.input)).status).toBe(403);
+    await sql`update platform.memberships set state='active' where person_id=${owner.personId}`;
+    t.http.clock.advance(120_000);
+    expect((await t.http.context(t.input)).status).toBe(403);
+  } finally { await t.stop(); }
+});
+
+test("membership context refuses bans, holds and minors and caps proof at parent or route expiry", async () => {
+  const t = await contextFixture();
+  try {
+    await sql`insert into platform.bans(id,scope,person_id,reason,banned_by) values('context-ban','person',${owner.personId},'fixture','fixture')`;
+    expect((await t.http.context(t.input)).status).toBe(403);
+    await sql`delete from platform.bans`;
+    await sql`update platform.phone_identities set hold='recycled_number' where person_id=${owner.personId}`;
+    expect((await t.http.context(t.input)).status).toBe(403);
+    await sql`update platform.phone_identities set hold=null where person_id=${owner.personId}`;
+    await sql`update platform.people set lowest_age=17 where id=${owner.personId}`;
+    expect((await t.http.context(t.input)).status).toBe(403);
+    await sql`update platform.people set lowest_age=30 where id=${owner.personId}`;
+    await sql`update platform.inbound set arrived_at=${new Date(now - 299_000)} where id='msg:blooio:consent-identity'`;
+    expect((await t.http.context(t.input)).body.expiresAt).toBe(now+1000);
+    await sql`update platform.inbound set arrived_at=${new Date(now)} where id='msg:blooio:consent-identity'`;
+    t.http.clock.advance(119_000);
+    expect((await t.http.context(t.input)).body.expiresAt).toBe(now+120_000);
+  } finally { await t.stop(); }
 });
