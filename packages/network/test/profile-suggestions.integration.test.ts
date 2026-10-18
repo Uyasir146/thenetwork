@@ -251,8 +251,9 @@ test("a canonical ban blocks promotion but permits deleting owned suggestions", 
 
 const httpSecret = "local-suggestion-review-fixture-secret-only";
 async function storedTurn(messageId: string, text: string, app = "ntwrk", memberId = "owned-member") {
-  await sql`insert into platform.inbound(id,received_at,arrived_at,status,sender_hash,response)
-    values(${`msg:blooio:${messageId}`},${new Date(now)},${new Date(now)},'done','fixture-phone-hash',${{ outcome: "open", app, memberId }}::jsonb)`;
+  await sql`insert into platform.inbound(id,received_at,arrived_at,status,sender_hash,response,request_hash)
+    values(${`msg:blooio:${messageId}`},${new Date(now)},${new Date(now)},'done','fixture-phone-hash',${{ outcome: "open", app, memberId }}::jsonb,
+      ${createHash('sha256').update(`synthetic-signed-${messageId}`).digest('hex')})`;
   await sql`insert into network.messages(id,app_id,member_id,direction,body,ts)
     values(${`in:blooio:${messageId}`},${app},${memberId},'inbound',${text},${new Date(now)})`;
 }
@@ -682,4 +683,91 @@ test("source proof expiry after authorization rolls saving back while revocation
     await new ProfileSuggestions(sql, async () => false).disconnect(p.who, p.consent.connectionId);
     expect((await sql`select value,status from platform.profile_suggestions where batch_id=${p.batch.id}`)[0]).toMatchObject({ value: null, status: "withdrawn" });
   } finally { await http.stop(); f.stop(); }
+});
+
+test("collection commits one private pending batch and one content-free receipt under concurrent replay", async () => {
+  const batchId = randomUUID();
+  await storedTurn("collect-once", `collect ${batchId}`);
+  const claim = { batchId, turnId: "msg:blooio:collect-once", requestSha256: digest("same signed collection envelope") };
+  const first = await Promise.all([store.propose(owner, input(), now, claim), store.propose(owner, input(), now, claim)]);
+  expect(first[0]?.id).toBe(batchId);
+  expect(first[1]).toEqual(first[0]);
+  expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(1);
+  expect(await sql`select id from platform.profile_suggestions`).toHaveLength(1);
+  expect(await facets()).toHaveLength(0);
+  const receipt = (await sql`select action_receipts from platform.inbound where id=${claim.turnId}`)[0].action_receipts;
+  expect(Object.keys(receipt)).toHaveLength(1);
+  expect(Object.values(receipt)[0]).toMatchObject({ state: "completed", requestHash: claim.requestSha256,
+    response: { kind: "profile_collection", batchId } });
+  expect(JSON.stringify(receipt)).not.toContain("climbing");
+  expect(await store.propose(owner, input([{ ...candidate(), value: "I enjoy hiking" }]), now, claim)).toBeNull();
+  expect(await store.propose(owner, input(), now, { ...claim, requestSha256: digest("different envelope") })).toBeNull();
+  expect(await store.propose({ ...owner, userId: "other" }, input(), now, claim)).toBeNull();
+  active = false;
+  expect(await store.propose(owner, input(), now, claim)).toBeNull();
+  expect(await facets()).toHaveLength(0);
+});
+
+test("collection replay never recreates deleted, rejected, edited or withdrawn suggestions", async () => {
+  for (const action of ["delete", "reject", "edit", "withdraw"]) {
+    const batchId = randomUUID();
+    await storedTurn(`collect-${action}`, `collect ${batchId}`);
+    const claim = { batchId, turnId: `msg:blooio:collect-${action}`, requestSha256: digest(action) };
+    const b = (await store.propose(owner, input(), now, claim))!;
+    if (action === "delete") await store.deleteBatch(owner, batchId);
+    else if (action === "withdraw") await store.disconnect(owner, candidate().connectionId);
+    else await store.decide(owner, { batchId, revision: 1, decisions: [{ suggestionId: b.suggestions[0]!.id,
+      action: action === "reject" ? "reject" : "accept", ...(action === "edit" ? { editedValue: "I enjoy hiking" } : {}) }] }, now);
+    expect(await store.propose(owner, input(), now, claim)).toBeNull();
+    if (action === "delete") {
+      await storedTurn("collect-later-turn", `collect ${batchId}`);
+      expect(await store.propose(owner, input(), now, { ...claim, turnId: "msg:blooio:collect-later-turn" })).toBeNull();
+    }
+    expect(await facets()).toHaveLength(0);
+  }
+});
+
+test("collection failure or authority expiry rolls pending data and idempotency receipt back together", async () => {
+  const batchId = randomUUID();
+  await storedTurn("collect-rollback", `collect ${batchId}`);
+  const claim = { batchId, turnId: "msg:blooio:collect-rollback", requestSha256: digest("rollback") };
+  let checks = 0;
+  const guarded = new ProfileSuggestions(sql, async () => true, undefined, { now: () => now, valid: () => ++checks < 3 });
+  await expect(guarded.propose(owner, input(), now, claim)).rejects.toThrow("expired");
+  expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(0);
+  expect(await sql`select id from platform.profile_suggestions`).toHaveLength(0);
+  expect((await sql`select action_receipts from platform.inbound where id=${claim.turnId}`)[0].action_receipts).toEqual({});
+  expect((await store.propose(owner, input(), now, claim))?.id).toBe(batchId);
+});
+
+test("collection rejects missing, foreign and handled parent turns without reserving a batch", async () => {
+  const claim = { batchId: randomUUID(), turnId: "msg:blooio:collect-unattested", requestSha256: digest("unattested") };
+  expect(await store.propose(owner, input(), now, claim)).toBeNull();
+  await storedTurn("collect-unattested", `collect ${claim.batchId}`);
+  await sql`update platform.inbound set request_hash=null where id=${claim.turnId}`;
+  expect(await store.propose(owner, input(), now, claim)).toBeNull();
+  await sql`update platform.inbound set request_hash=${digest('restored fixture signed parent')} where id=${claim.turnId}`;
+  await sql`update network.messages set body='model-created request' where id='in:blooio:collect-unattested'`;
+  expect(await store.propose(owner, input(), now, claim)).toBeNull();
+  await sql`update network.messages set body=${`collect ${claim.batchId}`} where id='in:blooio:collect-unattested'`;
+  await sql`update platform.inbound set response=${{ outcome: "handled", app: "ntwrk", memberId: "owned-member" }}::jsonb where id=${claim.turnId}`;
+  expect(await store.propose(owner, input(), now, claim)).toBeNull();
+  await sql`update platform.inbound set response=${{ outcome: "open", app: "friends", memberId: "foreign-member" }}::jsonb where id=${claim.turnId}`;
+  expect(await store.propose(owner, input(), now, claim)).toBeNull();
+  expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(0);
+});
+
+test("collection replay retains its source deadline instead of rebinding owner after source authorization", async () => {
+  const batchId = randomUUID();
+  await storedTurn("collect-source-fence", `collect ${batchId}`);
+  const claim = { batchId, turnId: "msg:blooio:collect-source-fence", requestSha256: digest("source-fence") };
+  await store.propose(owner, input(), now, claim);
+  let ownerReads = 0;
+  let sourceRead = false;
+  const guarded = new ProfileSuggestions(sql, async () => { sourceRead = true; return true; }, async () => {
+    ownerReads++; sourceRead = false; return true;
+  });
+  expect((await guarded.propose(owner, input(), now, claim))?.id).toBe(batchId);
+  expect(ownerReads).toBe(1);
+  expect(sourceRead).toBe(true);
 });

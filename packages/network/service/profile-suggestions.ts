@@ -24,6 +24,12 @@ export interface SuggestionSourceConsent {
   allowedKinds: SourceSuggestion["kind"][]; retainOnDisconnect: boolean;
 }
 export type SuggestionAuthorization = (owner: SuggestionOwner, consent: SuggestionSourceConsent, tx: SQL) => Promise<boolean>;
+export interface SuggestionProposal {
+  windowStart: number; windowEnd: number; timezone: string; expiresAt: number; retainOnDisconnect: boolean;
+  allowedKinds: SourceSuggestion["kind"][]; suggestions: SourceSuggestion[];
+}
+/** Internal server context, never inferred from a suggestion or a model-selected owner. */
+export interface SuggestionCollectionClaim { batchId: string; turnId: string; requestSha256: string }
 const sensitive = (s: string) => (fold(s).match(/\p{L}+/gu) ?? []).some(isSensitiveTerm);
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const valueOK = (s: unknown): s is string => typeof s === "string" && s.trim().length >= 2 && s.length <= 400
@@ -82,7 +88,7 @@ export class ProfileSuggestions {
       suggestions: rows.map((r: any) => ({ id: r.id, source: r.source, observedAt: new Date(r.observed_at).getTime(), kind: r.kind, value: r.value, tags: r.tags, confidence: r.confidence, scope: r.privacy_scope })) };
   }
 
-  async propose(owner: SuggestionOwner, input: { windowStart: number; windowEnd: number; timezone: string; expiresAt: number; retainOnDisconnect: boolean; allowedKinds: SourceSuggestion["kind"][]; suggestions: SourceSuggestion[] }, now: number): Promise<SuggestionReviewBatch | null> {
+  async propose(owner: SuggestionOwner, input: SuggestionProposal, now: number, claim?: SuggestionCollectionClaim): Promise<SuggestionReviewBatch | null> {
     if (!Number.isFinite(now) || !Number.isFinite(input.windowStart) || !Number.isFinite(input.windowEnd)
       || !(input.windowStart < input.windowEnd && input.expiresAt > now)
       || !Number.isFinite(input.expiresAt) || typeof input.retainOnDisconnect !== "boolean"
@@ -97,16 +103,57 @@ export class ProfileSuggestions {
         || !s.connectionId || s.connectionId.length > 200
         || s.tags.length > 12 || s.tags.some(t => !/^[a-z][a-z0-9_:-]{0,79}$/u.test(t) || sensitive(t.replace(/[_:]/gu, " ")))) return null;
     }
+    if (claim && (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(claim.batchId)
+      || !/^msg:(blooio|twilio):[^\r\n\u0000]{1,512}$/u.test(claim.turnId) || !/^[0-9a-f]{64}$/u.test(claim.requestSha256))) return null;
     return this.sql.begin(async tx => {
       const member = await this.owned(tx, owner);
       if (!member?.eligible) return null;
-      for (const s of input.suggestions) if (!await this.authorize(owner, { ...input, connectionId: s.connectionId, source: s.source }, tx)) return null;
-      const id = randomUUID();
+      for (const s of input.suggestions) if (!await this.authorize(owner, { connectionId: s.connectionId, source: s.source,
+        windowStart: input.windowStart, windowEnd: input.windowEnd, timezone: input.timezone,
+        allowedKinds: input.allowedKinds, retainOnDisconnect: input.retainOnDisconnect }, tx)) return null;
+      this.checkAuthority({ expires_at: new Date(input.expiresAt) });
+      const id = claim?.batchId ?? randomUUID();
+      const receiptKey = claim ? `profile-collect:${id}` : undefined;
+      const inputSha256 = hash(JSON.stringify(input));
+      if (claim) {
+        // Existing inbound action receipts are the durable idempotency owner. Deleting a batch
+        // never deletes this receipt, so replay cannot recreate erased private suggestions.
+        const [turn] = await tx`select i.response,i.action_receipts,i.request_hash,m.body
+          from platform.inbound i join platform.people p on p.phone_hash=i.sender_hash and p.id=${owner.personId}
+          join network.messages m on m.app_id=${owner.app} and m.member_id=${member.id} and m.id=${`in:${claim.turnId.slice(4)}`} and m.direction='inbound'
+          where i.id=${claim.turnId} and i.status='done' for update of i`;
+        if (turn?.response?.outcome !== 'open' || turn.response.app !== owner.app || turn.response.memberId !== member.id
+          || !/^[0-9a-f]{64}$/u.test(turn.request_hash ?? '') || turn.body !== `collect ${id}`) return null;
+        const prior = turn.action_receipts?.[receiptKey!];
+        if (prior) {
+          if (prior.state !== 'completed' || prior.requestHash !== claim.requestSha256 || prior.response?.kind !== 'profile_collection'
+            || prior.response.inputSha256 !== inputSha256 || prior.response.batchId !== id) return null;
+          // Owner/source were checked above in this same transaction. Do not rebind
+          // identity here and accidentally replace the freshly acquired source deadline.
+          const [b] = await tx`select * from platform.profile_suggestion_batches where id=${id} and app_id=${owner.app}
+            and person_id=${owner.personId} and member_id=${member.id} and user_id=${owner.userId}
+            and organization_id=${owner.organizationId} and chat_id=${owner.chatId} for update`;
+          if (!b || b.revision !== 1) return null;
+          const rows = await tx`select status from platform.profile_suggestions where batch_id=${id}`;
+          if (rows.length !== input.suggestions.length || rows.some((r: any) => r.status !== 'proposed')) return null;
+          const preview = await this.view(tx, b, this.fence?.now() ?? now);
+          this.checkAuthority(b);
+          return preview;
+        }
+        if (Object.keys(turn.action_receipts ?? {}).length >= 16) return null;
+        // A later turn cannot reuse an erased batch UUID while its original minimal receipt remains.
+        if ((await tx`select id from platform.inbound where jsonb_exists(action_receipts,${receiptKey!}) limit 1`).length) return null;
+        if ((await tx`select id from platform.profile_suggestion_batches where id=${id}`).length) return null;
+      }
       const [b] = await tx`insert into platform.profile_suggestion_batches(id,app_id,person_id,member_id,user_id,organization_id,chat_id,created_at,expires_at,window_start,window_end,timezone,allowed_kinds,retain_on_disconnect)
         values(${id},${owner.app},${owner.personId},${member.id},${owner.userId},${owner.organizationId},${owner.chatId},${new Date(now)},${new Date(input.expiresAt)},${new Date(input.windowStart)},${new Date(input.windowEnd)},${input.timezone},${tx.array(input.allowedKinds,"TEXT")},${input.retainOnDisconnect}) returning *`;
       for (const s of input.suggestions) await tx`insert into platform.profile_suggestions(id,batch_id,app_id,connection_id,source,observed_at,kind,confidence,value,tags,original_value_hash,privacy_scope)
         values(${randomUUID()},${id},${owner.app},${s.connectionId},${s.source},${new Date(s.observedAt)},${s.kind},${s.confidence},${s.value.trim()},${tx.array(s.tags,"TEXT")},${hash(s.value.trim())},${s.scope})`;
-      return this.view(tx, b, now);
+      if (claim) await tx`update platform.inbound set action_receipts=jsonb_set(action_receipts,array[${receiptKey!}],
+        ${{ state: 'completed', requestHash: claim.requestSha256, response: { kind: 'profile_collection', inputSha256, batchId: id } }}::jsonb) where id=${claim.turnId}`;
+      const preview = await this.view(tx, b, this.fence?.now() ?? now);
+      this.checkAuthority(b);
+      return preview;
     });
   }
 
