@@ -55,6 +55,24 @@ do $$ begin
   end if;
 end $$;
 alter table oauth.grants alter column phone_key set not null;
+alter table oauth.grants add column if not exists cloud_authority jsonb;
+do $$ begin
+  if not exists(select 1 from pg_constraint where conname='grants_cloud_authority_required' and conrelid='oauth.grants'::regclass) then
+    alter table oauth.grants add constraint grants_cloud_authority_required check
+      (id not like 'grant_cloud_%' or (cloud_authority is not null and jsonb_typeof(cloud_authority)='object' and coalesce(cloud_authority->>'version','')='1'));
+  end if;
+end $$;
+create or replace function oauth.keep_cloud_grant_authority() returns trigger language plpgsql as $$
+begin
+  if (old.id like 'grant_cloud_%' or old.cloud_authority is not null) and (new.id<>old.id or new.client_id<>old.client_id or new.cloud_authority is distinct from old.cloud_authority
+    or new.app_id<>old.app_id or new.phone_key<>old.phone_key or new.resource<>old.resource
+    or new.person_id is distinct from old.person_id or new.expires_at>old.expires_at) then
+    raise exception 'Cloud grant authority is immutable';
+  end if;
+  return new;
+end $$;
+drop trigger if exists keep_cloud_grant_authority on oauth.grants;
+create trigger keep_cloud_grant_authority before update on oauth.grants for each row execute function oauth.keep_cloud_grant_authority();
 drop index if exists oauth.grants_by_phone;
 create index if not exists grants_by_phone_key on oauth.grants (phone_key, app_id) where revoked_at is null;
 

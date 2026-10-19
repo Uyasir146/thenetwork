@@ -43,13 +43,13 @@ export class SessionService {
    * The live session for a token on this app. A session older than a day is rotated: the result
    * carries the new token, and the old token ends after a short grace time (not at once).
    */
-  async authenticate(app: AppId, token: string | undefined): Promise<{ session: Session; token: string; rotated: boolean } | undefined> {
+  async authenticate(app: AppId, token: string | undefined, rotate = true): Promise<{ session: Session; token: string; rotated: boolean } | undefined> {
     if (!token || token.length > 128) return undefined;
     const at = this.now();
     const s = await this.store.getSession(this.hash(token));
     if (!s || s.app !== app || (s.revokedAt !== null && s.revokedAt <= at) || s.expiresAt <= at) return undefined;
     // Already rotated (in its grace time), young, or at the end of its chain: use it as it is.
-    if (s.revokedAt !== null || at - s.createdAt < (this.opts.rotateMs ?? SESSION_ROTATE_MS)) return { session: s, token, rotated: false };
+    if (!rotate || s.revokedAt !== null || at - s.createdAt < (this.opts.rotateMs ?? SESSION_ROTATE_MS)) return { session: s, token, rotated: false };
     await this.store.revokeSession(s.tokenHash, at + SESSION_GRACE_MS);
     const cloud = token.startsWith("cloud.");
     const next = await this.create(app, s.e164, s.personId, s.tokenHash, s.startedAt, cloud ? s.expiresAt : undefined, cloud ? true : undefined);

@@ -479,8 +479,11 @@ export function createMcpHandler(o: McpHandlerOptions): McpHandler {
         return messagePage(c.app, "Not available", "This account cannot use this assistant connection.", 403);
       }
     }
+    const authority=o.platform.cloudAuthorityRequired?.(c.app.id)?await o.platform.cloudGrantAuthority?.(c.app.id,c.req,r.resource):undefined;
+    if(o.platform.cloudAuthorityRequired?.(c.app.id) && (!authority || authority.phoneKey!==o.platform.phoneKey(r.e164)))return messagePage(c.app,"Sign in again","Return to the app and sign in with Eliza before connecting.",403);
     const at = now();
-    const grant: Grant = { id: `grant_${randomId()}`, clientId: client.id, app: c.app.id, phoneKey: o.platform.phoneKey(r.e164), personId: r.personId, scopes: r.scopes, resource: r.resource, createdAt: at, expiresAt: at + ttl.grantMs, revokedAt: null };
+    const grant: Grant = { id: `${authority?"grant_cloud_":"grant_"}${randomId()}`, clientId: client.id, app: c.app.id, phoneKey: o.platform.phoneKey(r.e164), personId: r.personId, scopes: r.scopes, resource: r.resource, createdAt: at, expiresAt: Math.min(at + ttl.grantMs,authority?.expiresAt??Infinity), revokedAt: null,...(authority?{cloudAuthority:authority}:{}) };
+    if(!await cloudGrantCurrent(grant))return messagePage(c.app,"Sign in again","Your Eliza sign-in is no longer valid.",403);
     await store.putGrant(grant);
     await linked(grant, true);
     const code = randomToken("ntwc_");
@@ -535,7 +538,7 @@ export function createMcpHandler(o: McpHandlerOptions): McpHandler {
       if (res && canonicalResource(res, c.issuer) !== ac.resource) return bad("invalid_target");
       const grant = await store.getGrant(ac.grantId);
       if (!grant || grant.revokedAt !== null || grant.expiresAt <= at) return bad("invalid_grant");
-      if (!(await customSlopEligible(c, client, grant.personId, grant.phoneKey))) return bad("invalid_grant");
+      if (!(await customSlopEligible(c, client, grant.personId, grant.phoneKey)) || !await cloudGrantCurrent(grant)) return bad("invalid_grant");
       const pair = tokenPair(client, grant, ac.scopes, ac.resource);
       for (const token of pair.tokens) await store.putToken(token);
       await store.audit({ at, kind: "token_issued", clientId: client.id, grantId: grant.id, app: c.app.id, detail: ac.scopes.join(" ") });
@@ -548,7 +551,7 @@ export function createMcpHandler(o: McpHandlerOptions): McpHandler {
       if (!t || t.kind !== "refresh" || t.clientId !== client.id || t.revokedAt !== null || t.expiresAt <= at) return bad("invalid_grant");
       const grant = await store.getGrant(t.grantId);
       if (!grant || grant.revokedAt !== null || grant.expiresAt <= at) return bad("invalid_grant");
-      if (!(await customSlopEligible(c, client, grant.personId, grant.phoneKey))) return bad("invalid_grant");
+      if (!(await customSlopEligible(c, client, grant.personId, grant.phoneKey)) || !await cloudGrantCurrent(grant)) return bad("invalid_grant");
       const asked = form.get("scope") === null ? t.scopes : parseScopes(form.get("scope"));
       if (!asked || !asked.every(s => t.scopes.includes(s))) return bad("invalid_scope");
       const res = form.get("resource");
@@ -653,8 +656,15 @@ export function createMcpHandler(o: McpHandlerOptions): McpHandler {
     // RFC 8707: a token minted for another resource (another site, or the other surface) is refused.
     if (!t || t.kind !== "access" || t.revokedAt !== null || t.expiresAt <= at || t.resource !== resource || t.app !== c.app.id) return "invalid";
     const [grant, client] = await Promise.all([store.getGrant(t.grantId), store.getClient(t.clientId)]);
-    if (!grant || grant.revokedAt !== null || grant.expiresAt <= at || !client) return "invalid";
+    if (!grant || grant.revokedAt !== null || grant.expiresAt <= at || !client || !await cloudGrantCurrent(grant)) return "invalid";
     return { token: t, grant, client };
+  }
+
+  async function cloudGrantCurrent(grant: Grant): Promise<boolean> {
+    if(!grant.id.startsWith("grant_cloud_") && grant.cloudAuthority==null)return true;
+    if(!grant.cloudAuthority || !o.platform.validateCloudGrant)return false;
+    try{return await o.platform.validateCloudGrant(grant) && grant.expiresAt>now()
+      && grant.expiresAt<=grant.cloudAuthority.expiresAt && grant.cloudAuthority.expiresAt>now();}catch{return false;}
   }
 
   async function mcp(c: Ctx, pathSurface: Surface): Promise<Response> {

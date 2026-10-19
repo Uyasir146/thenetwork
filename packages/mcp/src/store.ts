@@ -3,6 +3,7 @@
 // Tokens and codes are stored only as sha256 hashes (they are 32 random bytes, so a plain hash is
 // enough). A client secret is stored the same way. The phone number of a grant stays on the server,
 // as platform.sessions keeps it; no tool and no response carries it.
+import type { CloudGrantAuthority } from "../../core/src/svc/network-delegation.ts";
 import type { McpAppId, Surface } from "./apps.ts";
 
 export type Scope = "apps:read" | "membership:read" | "profile:write";
@@ -44,6 +45,8 @@ export interface AuthRequest {
 
 /** A consent record: the person approved this client for these scopes in this app. Revocable. */
 export interface Grant {
+  /** Server-owned sealed Cloud delegation. NULL is valid only for genuine legacy phone grants. */
+  cloudAuthority?: CloudGrantAuthority | null;
   id: string;
   clientId: string;
   app: McpAppId;
@@ -193,7 +196,11 @@ export class MemoryOAuthStore implements OAuthStore {
   }
   async deleteAuthRequest(id: string) { this.requests.delete(id); }
 
-  async putGrant(g: Grant) { this.grants.set(g.id, structuredClone(g)); }
+  async putGrant(g: Grant) {
+    if(g.id.startsWith("grant_cloud_") && (!g.cloudAuthority || g.cloudAuthority.version!==1))throw new Error("Cloud grant authority required");
+    if(this.grants.has(g.id))throw new Error("Grant already exists");
+    this.grants.set(g.id, structuredClone(g));
+  }
   async getGrant(id: string) { return copy(this.grants.get(id)); }
   async grantsFor(phoneKey: string, app: McpAppId, at: number) {
     return [...this.grants.values()].filter(g => g.phoneKey === phoneKey && g.app === app && g.revokedAt === null && g.expiresAt > at).map(g => structuredClone(g));

@@ -12,6 +12,8 @@
 // Mount it in any Bun.serve fetch:
 //   const api = createPublicApi({ store, otp, turnstile });
 //   Bun.serve({ fetch: async (req, server) => (await api.fetch(req, server)) ?? new Response("not found", { status: 404 }) });
+import { NETWORK_SITES, type CloudGrantAuthority } from "../../core/src/svc/network-delegation.ts";
+import { productionCloudDelegation } from "./cloud-delegation.ts";
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import { type AccountHooks, Accounts, type HomeInput, type MemberHookContext, parseHome, parseJoin, publicMembership, type Who } from "./accounts.ts";
 import { APPS, type AppId, type AppInfo, appForHost, DEFAULT_HOST_MAP, DEV_HOST_MAP, isAppId, publicAppInfo, siteHosts, stagingSiteOrigins } from "./apps.ts";
@@ -28,7 +30,7 @@ import type { PhotoService } from "./photos.ts";
 export interface PublicApiOptions extends AccountHooks {
   store: PeopleStore;
   otp: OtpProvider;
-  /** Local gated Cloud SSO transport; production enablement is not supported by this slice. */
+  /** Cloud SSO transport override for isolated qualification; no provider calls are required by tests. */
   cloudAuthFetch?: typeof fetch;
   /** How long a positive Cloud validation is reused per session (default 60 s; 0 checks every request). */
   cloudValidationTtlMs?: number;
@@ -88,6 +90,10 @@ export interface MemberParticipation {
 export interface PeerInfo { requestIP(req: Request): { address: string } | null }
 
 export interface PublicApi {
+  authenticatedSiteSession(app: AppId, req: Request): ReturnType<SessionService["authenticate"]>;
+  cloudAuthorityRequired(app: AppId): boolean;
+  cloudGrantAuthority(app: AppId, req: Request, resource: string): Promise<CloudGrantAuthority | undefined>;
+  validateCloudGrant(grant: { app: AppId; resource: string; phoneKey: string; personId: string | null; cloudAuthority?: CloudGrantAuthority | null }): Promise<boolean>;
   /** The answer for an /api/* request, or undefined for any other path. Pass the Bun server for the socket address. */
   fetch(req: Request, server?: PeerInfo): Promise<Response | undefined>;
   accounts: Accounts;
@@ -140,7 +146,15 @@ export function createPublicApi(o: PublicApiOptions): PublicApi {
     if (value.protocol !== "http:" || !["localhost", "127.0.0.1"].includes(value.hostname) || value.href !== `${value.origin}/`) throw new Error("Cloud auth review requires an exact loopback site origin");
     return value.origin;
   };
+  const productionCloud = env.NETWORK_CLOUD_AUTH_ENABLED === "true" && env.NETWORK_CLOUD_AUTH_MODE === "production-v1";
   const cloudAuth = env.NETWORK_CLOUD_AUTH_ENABLED === "true" ? (() => {
+    if (productionCloud) {
+      if (env.PLATFORM_ENV !== "production" || env.NETWORK_CLOUD_AUTH_LOGIN_ORIGIN !== "https://cloud.eliza.app"
+        || env.NETWORK_CLOUD_AUTH_API_ORIGIN !== "https://api.eliza.app" || (env.SERVICE_TURN_SECRET?.length ?? 0) < 32
+        || env.NETWORK_CLOUD_AUTH_SITE_ORIGIN || Object.keys(stagingSiteOrigins(env)).length) throw new Error("Production Cloud auth needs the exact four-app production tuple and current service authority");
+      return { loginOrigin: "https://cloud.eliza.app", apiOrigin: "https://api.eliza.app", siteOrigin: "https://ntwrk.party", serverToken: "" };
+    }
+    if (env.NETWORK_CLOUD_AUTH_MODE && env.NETWORK_CLOUD_AUTH_MODE !== "staging-local") throw new Error("Unknown Cloud auth mode");
     if (!dev || env.NETWORK_CLOUD_AUTH_LOGIN_ORIGIN !== "https://cloud-staging.eliza.app"
       || env.NETWORK_CLOUD_AUTH_API_ORIGIN !== "https://api-staging.eliza.app"
       || (env.NETWORK_CLOUD_AUTH_SERVER_TOKEN?.length ?? 0) < 32) throw new Error("Cloud site auth requires the approved staging/local tuple and server authority");
@@ -159,7 +173,9 @@ export function createPublicApi(o: PublicApiOptions): PublicApi {
     hostMap[host] = app; apps[app] = { ...apps[app], domain: host };
   }
   const cloudApp = cloudAuth ? appForHost(new URL(cloudAuth.siteOrigin).host, hostMap) : undefined;
-  if (cloudAuth && !cloudApp) throw new Error("Cloud auth site must map to a canonical app");
+  if (cloudAuth && !productionCloud && !cloudApp) throw new Error("Cloud auth site must map to a canonical app");
+  const cloudFor = (app: AppId) => cloudAuth && (productionCloud || cloudApp === app) ? { ...cloudAuth, siteOrigin: productionCloud ? NETWORK_SITES[app] : cloudAuth.siteOrigin } : undefined;
+  const productionDelegation = productionCloud ? productionCloudDelegation({ secret: env.SERVICE_TURN_SECRET!, now, fetch: o.cloudAuthFetch }) : undefined;
   const log = o.log ?? (s => console.log(s));
   const accounts = new Accounts(o.store, {
     hashKey, now, env, apps: id => apps[id],
@@ -191,7 +207,7 @@ export function createPublicApi(o: PublicApiOptions): PublicApi {
   // HMAC, and each carries its kind as associated data: a pending cookie is never accepted as an identity,
   // and the browser never sees the phone number or the Cloud ids inside.
   const sealKey = createHash("sha256").update(`cloud-seal:${sessionSecret}`).digest();
-  type SealKind = "cloud-pending" | "cloud-identity";
+  type SealKind = "cloud-pending" | "cloud-identity" | "cloud-grant";
   const seal = (kind: SealKind, value: unknown) => {
     const iv = randomBytes(12);
     const cipher = createCipheriv("aes-256-gcm", sealKey, iv);
@@ -221,13 +237,13 @@ export function createPublicApi(o: PublicApiOptions): PublicApi {
   const VALIDATION_TTL_MS = o.cloudValidationTtlMs ?? 60_000;
   const validated = new Map<string, number>();
   async function cloudSessionStatus(app: AppId, jar: Map<string, string>, token: string): Promise<"valid" | "invalid" | "unavailable"> {
-    const cloud = cloudAuth && cloudApp === app ? cloudAuth : undefined;
+    const cloud = cloudFor(app);
     if (!cloud) return token.startsWith("cloud.") ? "invalid" : "valid";
     const identity = unseal("cloud-identity", jar.get(identityName(app)));
     const sessionHash = tokenHash(token, sessionSecret);
     if (!identity || identity.app !== app || identity.sessionHash !== sessionHash
       || typeof identity.expiresAt !== "number" || identity.expiresAt <= now()) { validated.delete(sessionHash); return "invalid"; }
-    if ((validated.get(sessionHash) ?? 0) > now()) return "valid";
+    if (!productionCloud && (validated.get(sessionHash) ?? 0) > now()) return "valid";
     const {kind: _kind, ...proof} = identity;
     const status = await validate(cloud, proof);
     if (status === "valid") {
@@ -237,6 +253,7 @@ export function createPublicApi(o: PublicApiOptions): PublicApi {
     return status;
   }
   async function validate(cloud: NonNullable<typeof cloudAuth>, identity: Record<string, unknown>): Promise<"valid" | "invalid" | "unavailable"> {
+    if (productionDelegation) return productionDelegation.validate(identity.app as AppId, identity);
     try {
       const response = await (o.cloudAuthFetch ?? fetch)(new Request(`${cloud.apiOrigin}/api/auth/sso-bridge/network-validate`, {
         method: "POST", headers: {"content-type": "application/json", origin: cloud.siteOrigin, authorization: `Bearer ${cloud.serverToken}`},
@@ -329,7 +346,7 @@ export function createPublicApi(o: PublicApiOptions): PublicApi {
       return res;
     };
 
-    const cloud = cloudAuth && cloudApp === appId ? cloudAuth : undefined;
+    const cloud = cloudFor(appId);
     const pendingName = dev ? `cloud_pending_${appId}` : "__Secure-cloud_pending";
     const pendingCookie = (value: string, age: number) => `${pendingName}=${value}; Path=/api/auth/cloud; HttpOnly; SameSite=Lax; Max-Age=${age}${dev ? "" : "; Secure"}`;
     switch (`${req.method} ${path}`) {
@@ -344,7 +361,8 @@ export function createPublicApi(o: PublicApiOptions): PublicApi {
         const challenge = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
         const signedState = seal("cloud-pending", {app: appId, state, verifier, returnPath, until: now()+300_000});
         const authorize = new URL("/network/sign-in", cloud.loginOrigin);
-        authorize.searchParams.set("networkSite", cloud.siteOrigin);
+        if (productionCloud) authorize.searchParams.set("app", appId);
+        else authorize.searchParams.set("networkSite", cloud.siteOrigin);
         authorize.searchParams.set("state", state);
         authorize.searchParams.set("challenge", Buffer.from(challenge).toString("hex"));
         return json(200, {url: authorize.href}, {"set-cookie": pendingCookie(signedState, 300)});
@@ -358,16 +376,24 @@ export function createPublicApi(o: PublicApiOptions): PublicApi {
         const code = url.searchParams.get("code");
         if (!code || !/^enso_[0-9a-f]{64}$/.test(code)) return reject(400);
         try {
-          const response = await (o.cloudAuthFetch ?? fetch)(new Request(`${cloud.apiOrigin}/api/auth/sso-bridge/network-exchange`, {
-            method: "POST", headers: {"content-type": "application/json", origin: cloud.siteOrigin, authorization: `Bearer ${cloud.serverToken}`},
-            body: JSON.stringify({code, codeVerifier: pending.verifier}), redirect: "error", cache: "no-store", signal: AbortSignal.timeout(5000),
-          }));
-          if (!response.ok || response.redirected) return reject(403);
-          const identity = await response.json() as {userId?: unknown; organizationId?: unknown; e164?: unknown; expiresAt?: unknown; stewardUserId?: unknown; issuedAt?: unknown};
+          let identity: Record<string, any>;
+          if (productionDelegation) {
+            const delegated = await productionDelegation.exchange(appId, code, pending.verifier);
+            if (!delegated) return reject(403);
+            identity = { ...delegated, identity: Object.fromEntries(Object.entries(delegated).filter(([key]) => key !== "proof")) };
+          } else {
+            const response = await (o.cloudAuthFetch ?? fetch)(new Request(`${cloud.apiOrigin}/api/auth/sso-bridge/network-exchange`, {
+              method: "POST", headers: {"content-type": "application/json", origin: cloud.siteOrigin, authorization: `Bearer ${cloud.serverToken}`},
+              body: JSON.stringify({code, codeVerifier: pending.verifier}), redirect: "error", cache: "no-store", signal: AbortSignal.timeout(5000),
+            }));
+            if (!response.ok || response.redirected) return reject(403);
+            identity = await response.json() as Record<string, any>;
+          }
           if (typeof identity.userId !== "string" || !identity.userId || typeof identity.organizationId !== "string" || !identity.organizationId
             || normalizePhone(identity.e164) !== identity.e164 || typeof identity.e164 !== "string" || typeof identity.expiresAt !== "number" || !Number.isFinite(identity.expiresAt) || identity.expiresAt <= now()
             || typeof identity.stewardUserId !== "string" || !identity.stewardUserId || typeof identity.issuedAt !== "number"
             || !Number.isSafeInteger(identity.issuedAt) || identity.issuedAt <= 0 || identity.issuedAt*1000 > now() + CLOUD_CLOCK_SKEW_MS) return reject(403);
+          if(await accounts.held(identity.e164) || await accounts.banned(identity.e164) || await o.store.isSuppressed(accounts.phoneHash(identity.e164)))return reject(403);
           await sessions.revoke(cookies.get(cookieName(appId)));
           await accounts.seen(identity.e164);
           const person = await accounts.personFor(identity.e164);
@@ -575,6 +601,40 @@ export function createPublicApi(o: PublicApiOptions): PublicApi {
 
   return {
     accounts, otp, sessions,
+    cloudAuthorityRequired: () => productionCloud,
+    async authenticatedSiteSession(app, req) {
+      const jar=parseCookies(req.headers.get("cookie")),token=jar.get(cookieName(app));
+      if(!token)return;
+      const status=await cloudSessionStatus(app,jar,token);
+      if(status!=="valid")return;
+      return sessions.authenticate(app,token,false);
+    },
+    async cloudGrantAuthority(app,req,resource) {
+      if(!productionCloud || ![`${NETWORK_SITES[app]}/mcp`,`${NETWORK_SITES[app]}/mcp/openai`].includes(resource))return;
+      const jar=parseCookies(req.headers.get("cookie")),token=jar.get(cookieName(app));
+      if(!token || await cloudSessionStatus(app,jar,token)!=="valid")return;
+      const session=await sessions.authenticate(app,token,false),identity=unseal("cloud-identity",jar.get(identityName(app)));
+      if(!session || !identity || !Number.isSafeInteger(identity.expiresAt) || typeof identity.issuedAt!=="number")return;
+      const authority={version:1 as const,app,resource,phoneKey:accounts.phoneHash(session.session.e164),issuedAt:identity.issuedAt,
+        expiresAt:Math.min(session.session.expiresAt,identity.expiresAt as number)};
+      return {...authority,sealed:seal("cloud-grant",{...authority,delegation:identity})};
+    },
+    async validateCloudGrant(grant) {
+      const authority=grant.cloudAuthority;
+      if(!productionDelegation || !authority || authority.version!==1 || authority.app!==grant.app || authority.resource!==grant.resource
+        || authority.phoneKey!==grant.phoneKey || !Number.isSafeInteger(authority.issuedAt) || authority.issuedAt*1000>now()
+        || !Number.isSafeInteger(authority.expiresAt) || authority.expiresAt<=now()
+        || typeof authority.sealed!=="string" || authority.sealed.length>16000)return false;
+      const value=unseal("cloud-grant",authority.sealed);
+      if(!value || ["version","app","resource","phoneKey","issuedAt","expiresAt"].some(key=>value[key]!==authority[key as keyof CloudGrantAuthority])
+        || !value.delegation || typeof value.delegation!=="object")return false;
+      const delegation=value.delegation as Record<string,unknown>;
+      if(typeof delegation.e164!=="string" || accounts.phoneHash(delegation.e164)!==grant.phoneKey)return false;
+      const owner=await accounts.byPhoneHash(grant.phoneKey);
+      if((grant.personId!==null && grant.personId!==owner?.person.id) || await accounts.held(delegation.e164) || await accounts.banned(delegation.e164)
+        || await o.store.isSuppressed(grant.phoneKey))return false;
+      return await productionDelegation.validate(grant.app,value.delegation as Record<string,unknown>)==="valid" && now()<authority.expiresAt;
+    },
     async fetch(req: Request, server?: PeerInfo) {
       const url = new URL(req.url);
       if (url.pathname !== "/api" && !url.pathname.startsWith("/api/")) return undefined;
