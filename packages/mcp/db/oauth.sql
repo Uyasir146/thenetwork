@@ -66,7 +66,7 @@ create or replace function oauth.keep_cloud_grant_authority() returns trigger la
 begin
   if (old.id like 'grant_cloud_%' or old.cloud_authority is not null) and (new.id<>old.id or new.client_id<>old.client_id or new.cloud_authority is distinct from old.cloud_authority
     or new.app_id<>old.app_id or new.phone_key<>old.phone_key or new.resource<>old.resource
-    or new.person_id is distinct from old.person_id or new.expires_at>old.expires_at) then
+    or new.person_id is distinct from old.person_id or new.scopes is distinct from old.scopes or new.expires_at>old.expires_at) then
     raise exception 'Cloud grant authority is immutable';
   end if;
   return new;

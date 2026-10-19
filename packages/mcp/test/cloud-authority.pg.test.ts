@@ -47,6 +47,22 @@ test("Cloud OAuth grants persist authority across issuance/refresh and deny revo
  await expect(store.putGrant({...legacy,id:`grant_cloud_${randomUUID()}`})).rejects.toThrow();
 });
 
+test("Cloud grant consent scopes cannot expand or shrink while legacy grants remain editable",async()=>{
+ const at=Date.now(),clientId=randomUUID();
+ await store.putClient({id:clientId,secretHash:null,name:"scope fixture",redirectUris:["https://client.example/callback"],authMethod:"none",app:"friends",surface:"full",kind:"dcr",createdAt:at});
+ const base:Grant={id:`grant_legacy_${randomUUID()}`,clientId,app:"friends",phoneKey:"scope-fixture-key",personId:randomUUID(),scopes:["membership:read"],resource:"https://friends.help/mcp",createdAt:at,expiresAt:at+60_000,revokedAt:null};
+ const authority={version:1 as const,app:"friends" as const,resource:base.resource,phoneKey:base.phoneKey,issuedAt:Math.floor(at/1000),expiresAt:base.expiresAt,sealed:"synthetic-scope-authority"};
+ for(const id of [`grant_cloud_${randomUUID()}`,`grant_imported_${randomUUID()}`]){
+  await store.putGrant({...base,id,cloudAuthority:authority});
+  await expect(Promise.resolve(store.sql`update oauth.grants set scopes=array['membership:read','profile:write'] where id=${id}`)).rejects.toThrow("Cloud grant authority is immutable");
+  await expect(Promise.resolve(store.sql`update oauth.grants set scopes=array[]::text[] where id=${id}`)).rejects.toThrow("Cloud grant authority is immutable");
+  expect((await store.getGrant(id))?.scopes).toEqual(base.scopes);
+ }
+ await store.putGrant(base);
+ await store.sql`update oauth.grants set scopes=array['membership:read','profile:write'] where id=${base.id}`;
+ expect((await store.getGrant(base.id))?.scopes).toEqual(["membership:read","profile:write"]);
+});
+
 test("refresh serialization respects concurrent grant revoke and preserves sealed authority",async()=>{
  const at=Date.now(),id=`grant_cloud_${randomUUID()}`;
  const client={id:randomUUID(),secretHash:null,name:"fixture",redirectUris:["https://client.example/callback"],authMethod:"none" as const,app:"friends" as const,surface:"full" as const,kind:"dcr" as const,createdAt:at};await store.putClient(client);
