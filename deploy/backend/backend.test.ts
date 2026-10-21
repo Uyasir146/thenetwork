@@ -6,6 +6,8 @@ import { SQL } from "bun";
 import { dropDb, emptyDb, pgAvailable } from "../../packages/platform/test/pg.ts";
 import { migrate } from "../../packages/observatory/db/migrate.ts";
 import { PROXY_MAX_SKEW_S, signProxyHeaders } from "../../packages/platform/src/proxy.ts";
+import { PROFILE_REVIEW_DISCONNECT_PATH } from "../../packages/core/src/svc/profile-review-disconnect.ts";
+import { PROFILE_REVIEW_WITHDRAWAL_PATH } from "../../packages/core/src/svc/profile-review-withdrawal.ts";
 import {
   BUILD_HEADER, CLIENT_IP, createBackend, ipOf, jsonLogger, loadConfig, normalizeEdge, PROXY_HEADERS,
   redact, routeLabel, serviceLoginProblem, type BackendConfig, type ServiceLike,
@@ -249,7 +251,9 @@ describe("routing", () => {
   test("the Eliza gateway's signed routes reach the service on the public port, /internal/relay included (it was 404), each under its own body cap", async () => {
     const { svc, calls } = fakeService();
     const b = createBackend({ svc, config: cfg(), log: silent, ping: async () => true });
-    for (const p of ["/internal/turn", "/internal/turn-receipt", "/internal/set-state", "/internal/signals", "/internal/updates", "/internal/relay"]) {
+    for (const p of ["/internal/turn", "/internal/turn-receipt", "/internal/set-state", "/internal/signals", "/internal/updates", "/internal/relay",
+      "/internal/profile-suggestions/preview", "/internal/profile-suggestions/decide", "/internal/profile-suggestions/delete", "/internal/profile-suggestions/collect", "/internal/profile-suggestions/consent-context",
+      PROFILE_REVIEW_DISCONNECT_PATH, PROFILE_REVIEW_WITHDRAWAL_PATH]) {
       const r = await b.publicFetch(new Request(`http://api.example.test${p}`, { method: "POST", body: "{}", headers: { "content-type": "application/json" } }));
       expect([p, r.status]).toEqual([p, 200]);
       expect(calls.at(-1)).toMatchObject({ kind: "staff", path: p });
@@ -261,6 +265,13 @@ describe("routing", () => {
     expect(calls.length).toBe(n);
     // The same size is fine on the turn route (256 KiB).
     expect((await b.publicFetch(new Request("http://api.example.test/internal/turn", { method: "POST", body: "x".repeat(17 * 1024), headers: { "content-length": String(17 * 1024) } }))).status).toBe(200);
+    expect((await b.publicFetch(new Request("http://api.example.test/internal/profile-suggestions/decide", { method: "POST", body: "x".repeat(17 * 1024), headers: { "content-length": String(17 * 1024) } }))).status).toBe(413);
+    for (const path of [PROFILE_REVIEW_DISCONNECT_PATH, PROFILE_REVIEW_WITHDRAWAL_PATH]) {
+      const before = calls.length;
+      const r = await b.publicFetch(new Request(`http://api.example.test${path}`, { method: "POST", body: "x".repeat(4097), headers: { "content-length": "4097" } }));
+      expect(r.status).toBe(413);
+      expect(calls.length).toBe(before);
+    }
   });
 
   test("deployed, an unsigned request names no site: /api and /mcp answer 421 (audit: Host: slop.date was served as slop.date)", async () => {
@@ -392,7 +403,7 @@ describe.skipIf(!pgAvailable)("boot (dev Postgres, a database of its own)", () =
     const svcUrl = Object.assign(new URL(url), { username: role }).toString();
     const env: Record<string, string> = {
       ...process.env as Record<string, string>, ...DEPLOYED, DATABASE_URL: svcUrl, MIGRATION_DATABASE_URL: url, PORT: String(port), STAFF_PORT: String(staff), TICK_MS: "3600000",
-      PLATFORM_DB_ENVIRONMENT_INIT: "1", BUILD_ID: "boot-test", NODE_ENV: "", NETWORK_CHANNEL: "", BLOOIO_ALLOW_SEND: "", NTWRK_LIVE_APPROVED: "",
+      PLATFORM_DB_ENVIRONMENT_INIT: "1", BUILD_ID: "boot-test", NODE_ENV: "", NETWORK_CHANNEL: "", BLOOIO_ALLOW_SEND: "", NTWRK_LIVE_APPROVED: "", NETWORK_PROFILE_REVIEW_ENABLED: "0",
     };
     const proc = Bun.spawn(["bun", "run", `${import.meta.dir}/server.ts`], { env, stdout: "pipe", stderr: "pipe" });
     const out = new Response(proc.stdout).text();
@@ -417,6 +428,16 @@ describe.skipIf(!pgAvailable)("boot (dev Postgres, a database of its own)", () =
       expect([spoof.status, (await spoof.json()).error]).toEqual([421, "edge_required"]);
       expect((await fetch(`http://127.0.0.1:${port}/review`)).status).toBe(404);
       expect((await fetch(`http://127.0.0.1:${staff}/health`)).status).toBe(401);
+      // The actual service owns cleanup authority; the public router must forward these routes
+      // without granting access when the private profile-review runtime is off.
+      for (const path of [PROFILE_REVIEW_DISCONNECT_PATH, PROFILE_REVIEW_WITHDRAWAL_PATH]) {
+        const r = await fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", body: "{}" });
+        expect(r.status).toBe(503);
+        expect(await r.json()).toEqual({ error: "cleanup_unavailable" });
+        expect(r.headers.get("cache-control")).toBe("no-store");
+        const big = await fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", body: "x".repeat(4097) });
+        expect(big.status).toBe(413);
+      }
     } finally {
       proc.kill("SIGTERM");
     }

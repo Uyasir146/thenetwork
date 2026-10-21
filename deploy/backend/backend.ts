@@ -27,6 +27,9 @@ import { timingSafeEqual } from "node:crypto";
 import { opsConfigFromEnv, type OpsConfig } from "./ops.ts";
 import { networkRoutePolicy } from "../../packages/network/service/route-authority.ts";
 import { RELAY_MAX_BODY_BYTES, RELAY_PATH } from "../../packages/network/service/relay-endpoint.ts";
+import { SUGGESTION_PATH } from "../../packages/network/service/profile-suggestion-endpoint.ts";
+import { PROFILE_REVIEW_DISCONNECT_PATH } from "../../packages/core/src/svc/profile-review-disconnect.ts";
+import { PROFILE_REVIEW_WITHDRAWAL_PATH } from "../../packages/core/src/svc/profile-review-withdrawal.ts";
 
 export { PROXY_HEADERS };
 /** The visitor IP the public API reads (ipOf). Present only on a verified request. */
@@ -34,9 +37,12 @@ export const CLIENT_IP = PROXY_HEADERS.ip;
 export const BUILD_HEADER = "x-network-build";
 const STRIP = ["x-forwarded-host", "x-forwarded-for", "x-forwarded-proto", "x-real-ip", "forwarded", "true-client-ip"];
 /** The Eliza gateway's signed routes (served by the service) and their body cap (the service's MAX_BODY_BYTES). */
-const INTERNAL_PATHS = new Set(["/internal/turn", "/internal/turn-receipt", "/internal/set-state", "/internal/signals", "/internal/updates", "/internal/relay"]);
+const INTERNAL_PATHS = new Set(["/internal/turn", "/internal/turn-receipt", "/internal/set-state", "/internal/signals", "/internal/updates", "/internal/relay",
+  PROFILE_REVIEW_DISCONNECT_PATH, PROFILE_REVIEW_WITHDRAWAL_PATH,
+  ...["preview", "decide", "delete", "collect", "consent-context"].map(action => SUGGESTION_PATH + action)]);
 const MAX_INTERNAL_BODY = 256 * 1024;
-const internalCap = (path: string) => (path === RELAY_PATH ? RELAY_MAX_BODY_BYTES : MAX_INTERNAL_BODY);
+const internalCap = (path: string) => path === PROFILE_REVIEW_DISCONNECT_PATH || path === PROFILE_REVIEW_WITHDRAWAL_PATH
+  ? 4096 : path === RELAY_PATH || path.startsWith(SUGGESTION_PATH) ? RELAY_MAX_BODY_BYTES : MAX_INTERNAL_BODY;
 
 // ------------------------------------------------------------------ config
 
