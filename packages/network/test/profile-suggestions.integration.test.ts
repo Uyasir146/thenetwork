@@ -169,8 +169,11 @@ test("the authorizer receives the exact chosen window, fields and retention; fut
   const seen: unknown[] = [];
   const restricted = new ProfileSuggestions(sql, async (_owner, consent) => { seen.push(consent); return consent.windowEnd === now + 86_400_000 && !consent.retainOnDisconnect; });
   expect(await restricted.propose(owner, input(), now)).toBeNull();
-  const b = await restricted.propose(owner, { ...input(), windowStart: now, windowEnd: now + 86_400_000 }, now);
+  const eventStart = now + 3_600_000;
+  const b = await restricted.propose(owner, { ...input([{ ...candidate(), source: "google_calendar", observedAt: eventStart }]), windowStart: now, windowEnd: now + 86_400_000 }, now);
   expect(b?.windowEnd).toBe(now + 86_400_000);
+  expect(b?.suggestions[0]?.source).toBe("google_calendar");
+  expect(b?.suggestions[0]?.observedAt).toBe(eventStart);
   expect(seen[1]).toMatchObject({ windowStart: now, windowEnd: now + 86_400_000, allowedKinds: ["interest"], retainOnDisconnect: false });
 });
 

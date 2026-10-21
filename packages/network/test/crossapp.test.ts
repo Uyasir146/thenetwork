@@ -144,7 +144,7 @@ describe.skipIf(!pgAvailable)("cross_app_leak: two apps, shared people (Postgres
     await admin(`drop database if exists ${DB} with (force)`).catch(() => {});
   });
 
-  test("a proposed inferred database interest is not treated as confirmed matching evidence", async () => {
+  test("inferred matching needs confirmation and Google-derived facts remain excluded", async () => {
     await applySchema(URL_, { reset: true, lockTimeout: "5s" });
     const clock = new SimClock(START);
     const svc = new NetworkService({ url: URL_, clock, instance: "inferred-facet", log: () => {}, env: { PLATFORM_ENV: "dev" }, networks: APPS_RUN.map(app => ({ id: `${app}:nyc` })) });
@@ -164,10 +164,19 @@ describe.skipIf(!pgAvailable)("cross_app_leak: two apps, shared people (Postgres
     };
     expect((await matchEvidence()).score).toBe(0);
     await sql`update network.facets set status = 'confirmed' where id = 'proposed-interest'`;
+    const googleConfirmed = await matchEvidence();
+    expect(googleConfirmed.score).toBe(0);
+    expect(googleConfirmed.snap.facets.some(f => f.id === "proposed-interest")).toBe(false);
+    // Confirmation alone never opts Google-derived facts into automatic matching.
+    // A non-Google inferred fact is the positive control for confirmation semantics.
+    await sql`insert into network.facets (app_id, id, member_id, kind, value, tags, privacy_scope, provenance, source, confidence, status, valid_from) values
+      ('ntwrk', 'reviewed-chat-interest', ${b}, 'interest', 'hiking', '{hiking}', 'matchable', 'inferred', 'chat', 0.9, 'proposed', ${new Date(START)})`;
+    expect((await matchEvidence()).score).toBe(0);
+    await sql`update network.facets set status = 'confirmed' where id = 'reviewed-chat-interest'`;
     const confirmed = await matchEvidence();
     expect(confirmed.score).toBe(0.3);
-    expect(confirmed.snap.facets.find(f => f.id === "proposed-interest")).toMatchObject({ provenance: "inferred", source: "gmail", inferred: true, confirmedByMember: true });
-    await sql`update network.facets set status = 'rejected' where id = 'proposed-interest'`;
+    expect(confirmed.snap.facets.find(f => f.id === "reviewed-chat-interest")).toMatchObject({ provenance: "inferred", source: "chat", inferred: true, confirmedByMember: true });
+    await sql`update network.facets set status = 'rejected' where id in ('proposed-interest', 'reviewed-chat-interest')`;
     expect((await matchEvidence()).score).toBe(0);
   }, T);
 
