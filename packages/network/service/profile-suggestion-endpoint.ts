@@ -1,3 +1,4 @@
+import { parseNetworkCollectionCommand } from "../../core/src/svc/learning-collection-command.ts";
 import type { SQL } from "bun";
 import { createHash } from "node:crypto";
 import { parseNetworkRouteAuthorityV1, type NetworkRouteAuthorityV1 } from "../../core/src/svc/contract.ts";
@@ -5,7 +6,7 @@ import type { AppId } from "../../platform/src/apps.ts";
 import { isAppId } from "../../platform/src/apps.ts";
 import { readCapped } from "../../platform/src/body.ts";
 import { svcVerify } from "../../core/src/svc/svc-auth.ts";
-import { ProfileSuggestions, type SuggestionAuthorization, type SuggestionOwner, type SuggestionReviewBatch, type SuggestionProposal } from "./profile-suggestions.ts";
+import { ProfileSuggestions, collectionProposalMatchesStoredCommand, type SuggestionAuthorization, type SuggestionOwner, type SuggestionReviewBatch, type SuggestionProposal } from "./profile-suggestions.ts";
 import { renderSuggestionReview, reviewSuggestionMessage } from "./profile-suggestion-review.ts";
 import { routeEnvelopeAllowed, type NetworkRoutePolicy } from "./route-authority.ts";
 
@@ -20,6 +21,8 @@ export interface SuggestionTurnIdentity {
   networkAuthority?: NetworkRouteAuthorityV1;
   /** Requested retention deadline derived from the validated collection proposal. */
   pendingExpiresAt?: number;
+  /** Validated collection proposal; canonical stored turn remains the authority. */
+  collectionProposal?: SuggestionProposal;
 }
 /** Cloud supplies its existing trusted binding lookup, never model-provided identity fields.
  * It must recheck the current user/org/chat binding and revocation using this transaction.
@@ -60,14 +63,15 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
     || (b.channel !== "blooio" && b.channel !== "twilio") || !validId(b.messageId, 512) || !uuid(b.batchId)
     || auth.id !== `${b.messageId}:suggestions:${action}` || (action !== "preview" && !validId(b.text, 2000))) return json({ error: "invalid_request" }, 400);
   const proposal = action === "collect" ? parseCollectionProposal(b.proposal) : undefined;
-  if (action === "collect" && (!proposal || b.text !== `collect ${b.batchId}`)) return json({ error: "invalid_collection" }, 400);
+  const collection = action === "collect" && typeof b.text === "string" ? parseNetworkCollectionCommand(b.text) : undefined;
+  if (action === "collect" && (!proposal || collection?.kind !== "collect" || collection.batchId !== b.batchId)) return json({ error: "invalid_collection" }, 400);
   const channel = b.channel, messageId = b.messageId, batchId = b.batchId;
   let proofValidUntil: number | undefined;
   let proofValid: (() => boolean) | undefined;
   // Resolve the person from the signed, completed open turn. Model identity fields are not accepted.
   const resolve = async (tx: SQL): Promise<SuggestionOwner | null> => {
     if (!routeEnvelopeAllowed(d.routePolicy, b.networkAuthority, d.now())) return null;
-    const [turn] = await tx`select sender_hash,response,network_authority from platform.inbound where id=${`msg:${channel}:${messageId}`} and status='done'`;
+    const [turn] = await tx`select sender_hash,response,network_authority,arrived_at from platform.inbound where id=${`msg:${channel}:${messageId}`} and status='done'`;
     if (!turn || turn.response?.outcome !== "open" || !isAppId(turn.response.app) || !validId(turn.response.memberId, 256)
       || !routeEnvelopeAllowed(d.routePolicy, turn.network_authority ?? undefined, d.now())) return null;
     const app = turn.response.app, memberId = turn.response.memberId;
@@ -78,11 +82,12 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
     const [message] = await tx`select body from network.messages where app_id=${app} and member_id=${memberId}
       and id=${`in:${channel}:${messageId}`} and direction='inbound'`;
     if (!message || typeof message.body !== "string" || (action !== "preview" && message.body !== b.text)) return null;
+    if (proposal && !collectionProposalMatchesStoredCommand(proposal, message.body, batchId, new Date(turn.arrived_at).getTime(), d.now())) return null;
     const networkAuthority = parseNetworkRouteAuthorityV1(turn.network_authority);
     const binding = await d.resolveIdentity!({ personId: person.id, memberId, app, channel, messageId,
       action: action as SuggestionTurnIdentity["action"], batchId,
       commandSha256: createHash("sha256").update(message.body).digest("hex"),
-      ...(proposal ? { pendingExpiresAt: proposal.expiresAt } : {}),
+      ...(proposal ? { pendingExpiresAt: proposal.expiresAt, collectionProposal: proposal } : {}),
       ...(networkAuthority ? { networkAuthority } : {}) }, tx);
     if (!binding || !validId(binding.userId, 256) || !validId(binding.organizationId, 256) || !validId(binding.chatId, 256)) return null;
     if (binding.validUntil !== undefined && (!Number.isSafeInteger(binding.validUntil) || binding.validUntil <= d.now())) return null;
@@ -102,7 +107,7 @@ export async function profileSuggestionEndpoint(d: SuggestionEndpointDeps, req: 
       && (!d.routePolicy || d.now() < d.routePolicy.admitUntil) });
     if (action === "collect") {
       const batch = await store.propose(owner, proposal!, d.now(), { batchId, turnId: `msg:${channel}:${messageId}`,
-        requestSha256: createHash("sha256").update(raw).digest("hex") });
+        requestSha256: createHash("sha256").update(raw).digest("hex"), commandSha256: createHash("sha256").update(b.text as string).digest("hex") });
       const reviewText = batch && renderSuggestionReview(batch, owner, d.now());
       return batch && reviewText ? json({ kind: "preview", batch, reviewText })
         : json({ kind: "denied", reviewText: "I couldn’t collect those suggestions. Nothing new was saved." }, 403);

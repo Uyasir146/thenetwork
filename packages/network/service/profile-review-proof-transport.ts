@@ -14,7 +14,7 @@ export function profileReviewProofTransport(o: ProfileReviewProofTransportOption
     || o.secret.length < 32) throw new Error("Profile review proof requires an exact trusted origin and service secret");
   return async (path: string, id: string, payload: unknown): Promise<{ value: unknown; selectorSha256: string; now: number } | null> => {
     const before = o.now();
-    if (!Number.isSafeInteger(before) || !/^\/api\/internal\/network\/profile-review-(?:owner|source)$/u.test(path)) return null;
+    if (!Number.isSafeInteger(before) || !/^\/api\/internal\/network\/profile-review-(?:owner|source|disconnect|withdrawal)$/u.test(path)) return null;
     const body = JSON.stringify(payload);
     if (new TextEncoder().encode(body).length > 16 * 1024) return null;
     const controller = new AbortController();

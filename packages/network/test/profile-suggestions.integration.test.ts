@@ -1,3 +1,6 @@
+import { buildWorld, resolveConfig, localEmbed } from "@thenetwork/engine";
+import { parseNetworkCollectionCommand, hashNetworkCollectionSelection, type NetworkCollectionSelection } from "../../core/src/svc/learning-collection-command.ts";
+import { COLLECTION_COMMAND_VECTORS } from "./fixtures/learning-collection-command-vectors.ts";
 import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
 import { SQL } from "bun";
 import { createHash, randomUUID } from "node:crypto";
@@ -15,7 +18,7 @@ import { PROFILE_REVIEW_OWNER_PATH, parseProfileReviewOwnerRequest } from "../..
 import { PROFILE_REVIEW_SOURCE_PATH, parseProfileReviewSourceRequest, type ProfileReviewSourceRequest } from "../../core/src/svc/profile-review-source.ts";
 import { profileReviewFactory, profileReviewFromEnv } from "../service/profile-review-factory.ts";
 import type { NetworkRoutePolicy } from "../service/route-authority.ts";
-import { LEARNING_CONSENT_CONTEXT_PATH, parseLearningConsentContextProof, type LearningConsentContextRequest } from "../../core/src/svc/learning-consent-context.ts";
+import { LEARNING_CONSENT_CONTEXT_PATH, parseLearningConsentContextProof, type LearningConsentContextRequest, NETWORK_LEARNING_ENTRY_SELECTION_SHA256 } from "../../core/src/svc/learning-consent-context.ts";
 
 const now = Date.UTC(2026, 9, 17, 12);
 const db = `profile_suggestions_${process.pid}`;
@@ -28,7 +31,9 @@ const candidate = (): SourceSuggestion => ({ connectionId: "owned-google-connect
   kind: "interest", value: "I enjoy climbing", tags: ["climbing"], confidence: 0.7, scope: "agent_private" });
 const input = (suggestions = [candidate()], retainOnDisconnect = false) => ({ windowStart: now - 60_000, windowEnd: now,
   timezone: "America/Los_Angeles", allowedKinds: ["interest" as const], expiresAt: now + 60_000, retainOnDisconnect, suggestions });
-const facets = async () => (await loadSnapshot(sql, now, { app: "ntwrk" })).facets;
+const collectionText = (id: string, proposal = input()) => `collect ${id} gmail from ${new Date(proposal.windowStart).toISOString().replace(".000Z", "Z")} until ${new Date(proposal.windowEnd).toISOString().replace(".000Z", "Z")} timezone ${proposal.timezone} fields ${proposal.allowedKinds.join(",")} retain ${proposal.retainOnDisconnect ? "keep" : "delete"}`;
+// This helper is an owned profile review, never a matcher/background snapshot.
+const facets = async () => (await loadSnapshot(sql, now, { app: "ntwrk", purpose: "profile_review" })).facets;
 
 beforeAll(async () => {
   await devPgUp();
@@ -63,6 +68,23 @@ test("pending data never enters the canonical snapshot; exact review promotes so
   expect((await sql`select value,tags,status from platform.profile_suggestions`)[0]).toMatchObject({ value: null, tags: [], status: "accepted" });
   expect(await store.decide(owner, { batchId: b.id, revision: b.revision, decisions: [{ suggestionId: b.suggestions[0]!.id, action: "accept" }] }, now)).toEqual({ kind: "denied" });
   expect(await facets()).toHaveLength(1);
+});
+
+test("a selected future Calendar event retains its time without allowing future Gmail or out-of-window events", async () => {
+  const eventStart = now + 3_600_000;
+  const calendar: SourceSuggestion = { ...candidate(), source: "google_calendar", observedAt: eventStart,
+    value: "I enjoy group walks", tags: ["walking"] };
+  const selected = { ...input([candidate(), calendar]), windowEnd: eventStart + 1000 };
+  const batch = await store.propose(owner, selected, now);
+  expect(batch?.suggestions).toHaveLength(2);
+  expect(batch?.suggestions.find(s => s.source === "google_calendar")?.observedAt).toBe(eventStart);
+  const [stored] = await sql`select observed_at from platform.profile_suggestions where batch_id=${batch!.id} and source='google_calendar'`;
+  expect(new Date(stored.observed_at).getTime()).toBe(eventStart);
+  expect(await store.propose(owner, { ...selected, suggestions: [{ ...candidate(), observedAt: eventStart }] }, now)).toBeNull();
+  expect(await store.propose(owner, { ...selected, suggestions: [{ ...calendar, observedAt: selected.windowEnd }] }, now)).toBeNull();
+  expect(await store.propose(owner, { ...selected, suggestions: [{ ...calendar, observedAt: selected.windowEnd + 1 }] }, now)).toBeNull();
+  expect(await store.propose(owner, { ...selected, suggestions: [{ ...calendar, observedAt: selected.windowStart - 1 }] }, now)).toBeNull();
+  expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(1);
 });
 
 test("wrong owner, organization, chat, app and stale revisions do not promote data", async () => {
@@ -696,7 +718,7 @@ test("source proof expiry after authorization rolls saving back while revocation
 
 test("collection commits one private pending batch and one content-free receipt under concurrent replay", async () => {
   const batchId = randomUUID();
-  await storedTurn("collect-once", `collect ${batchId}`);
+  await storedTurn("collect-once", collectionText(batchId));
   const claim = { batchId, turnId: "msg:blooio:collect-once", requestSha256: digest("same signed collection envelope") };
   const first = await Promise.all([store.propose(owner, input(), now, claim), store.propose(owner, input(), now, claim)]);
   expect(first[0]?.id).toBe(batchId);
@@ -720,7 +742,7 @@ test("collection commits one private pending batch and one content-free receipt 
 test("collection replay never recreates deleted, rejected, edited or withdrawn suggestions", async () => {
   for (const action of ["delete", "reject", "edit", "withdraw"]) {
     const batchId = randomUUID();
-    await storedTurn(`collect-${action}`, `collect ${batchId}`);
+    await storedTurn(`collect-${action}`, collectionText(batchId));
     const claim = { batchId, turnId: `msg:blooio:collect-${action}`, requestSha256: digest(action) };
     const b = (await store.propose(owner, input(), now, claim))!;
     if (action === "delete") await store.deleteBatch(owner, batchId);
@@ -729,7 +751,7 @@ test("collection replay never recreates deleted, rejected, edited or withdrawn s
       action: action === "reject" ? "reject" : "accept", ...(action === "edit" ? { editedValue: "I enjoy hiking" } : {}) }] }, now);
     expect(await store.propose(owner, input(), now, claim)).toBeNull();
     if (action === "delete") {
-      await storedTurn("collect-later-turn", `collect ${batchId}`);
+      await storedTurn("collect-later-turn", collectionText(batchId));
       expect(await store.propose(owner, input(), now, { ...claim, turnId: "msg:blooio:collect-later-turn" })).toBeNull();
     }
     expect(await facets()).toHaveLength(0);
@@ -738,7 +760,7 @@ test("collection replay never recreates deleted, rejected, edited or withdrawn s
 
 test("collection failure or authority expiry rolls pending data and idempotency receipt back together", async () => {
   const batchId = randomUUID();
-  await storedTurn("collect-rollback", `collect ${batchId}`);
+  await storedTurn("collect-rollback", collectionText(batchId));
   const claim = { batchId, turnId: "msg:blooio:collect-rollback", requestSha256: digest("rollback") };
   let checks = 0;
   const guarded = new ProfileSuggestions(sql, async () => true, undefined, { now: () => now, valid: () => ++checks < 3 });
@@ -752,13 +774,13 @@ test("collection failure or authority expiry rolls pending data and idempotency 
 test("collection rejects missing, foreign and handled parent turns without reserving a batch", async () => {
   const claim = { batchId: randomUUID(), turnId: "msg:blooio:collect-unattested", requestSha256: digest("unattested") };
   expect(await store.propose(owner, input(), now, claim)).toBeNull();
-  await storedTurn("collect-unattested", `collect ${claim.batchId}`);
+  await storedTurn("collect-unattested", collectionText(claim.batchId));
   await sql`update platform.inbound set request_hash=null where id=${claim.turnId}`;
   expect(await store.propose(owner, input(), now, claim)).toBeNull();
   await sql`update platform.inbound set request_hash=${digest('restored fixture signed parent')} where id=${claim.turnId}`;
   await sql`update network.messages set body='model-created request' where id='in:blooio:collect-unattested'`;
   expect(await store.propose(owner, input(), now, claim)).toBeNull();
-  await sql`update network.messages set body=${`collect ${claim.batchId}`} where id='in:blooio:collect-unattested'`;
+  await sql`update network.messages set body=${collectionText(claim.batchId)} where id='in:blooio:collect-unattested'`;
   await sql`update platform.inbound set response=${{ outcome: "handled", app: "ntwrk", memberId: "owned-member" }}::jsonb where id=${claim.turnId}`;
   expect(await store.propose(owner, input(), now, claim)).toBeNull();
   await sql`update platform.inbound set response=${{ outcome: "open", app: "friends", memberId: "foreign-member" }}::jsonb where id=${claim.turnId}`;
@@ -768,7 +790,7 @@ test("collection rejects missing, foreign and handled parent turns without reser
 
 test("collection replay retains its source deadline instead of rebinding owner after source authorization", async () => {
   const batchId = randomUUID();
-  await storedTurn("collect-source-fence", `collect ${batchId}`);
+  await storedTurn("collect-source-fence", collectionText(batchId));
   const claim = { batchId, turnId: "msg:blooio:collect-source-fence", requestSha256: digest("source-fence") };
   await store.propose(owner, input(), now, claim);
   let ownerReads = 0;
@@ -785,7 +807,7 @@ test("internal collect joins canonical signed owner/source proofs to one pending
   const f = await ownerProofFixture();
   const batchId = randomUUID(), connectionId = randomUUID();
   const proposal = input([{ ...candidate(), connectionId }]);
-  const text = `collect ${batchId}`;
+  const text = collectionText(batchId);
   const callbacks = profileReviewFactory(f.options);
   const http = await reviewHttp(callbacks.profileSuggestionIdentity, callbacks.profileSuggestionAuthorization, f.policy);
   try {
@@ -824,8 +846,8 @@ test("collect wire rejects raw source payloads, foreign identities, fake command
   const callbacks = profileReviewFactory(f.options);
   const http = await reviewHttp(callbacks.profileSuggestionIdentity, callbacks.profileSuggestionAuthorization, f.policy);
   try {
-    await reviewCommandTurn(f, "wire-collect", `collect ${batchId}`);
-    const args = { text: `collect ${batchId}`, proposal: input([{ ...candidate(), connectionId: randomUUID() }]), networkAuthority: f.policy.authority };
+    await reviewCommandTurn(f, "wire-collect", collectionText(batchId));
+    const args = { text: collectionText(batchId), proposal: input([{ ...candidate(), connectionId: randomUUID() }]), networkAuthority: f.policy.authority };
     for (const extra of [{ userId: randomUUID() }, { proposal: null }, { proposal: { ...args.proposal, rawMailBody: "private mail" } },
       { proposal: { ...args.proposal, suggestions: [{ ...args.proposal.suggestions[0], rawEvent: {} }] } },
       { proposal: { ...args.proposal, allowedKinds: ["interest", "interest"] } },
@@ -843,7 +865,7 @@ async function contextFixture() {
   const batchId = randomUUID();
   await reviewCommandTurn(f, "consent-identity", `collect ${batchId}`);
   await sql`insert into platform.phone_identities(e164,person_id,verified_at,method) values('+12125550100',${owner.personId},${new Date(now)},'inbound_message')`;
-  const input: LearningConsentContextRequest = { version: 1, purpose: 'network_profile_learning_v1', selectionSha256: digest('exact displayed selection'),
+  const input: LearningConsentContextRequest = { version: 1, purpose: 'network_profile_learning_v1', selectionSha256: NETWORK_LEARNING_ENTRY_SELECTION_SHA256,
     review: { version: 1, channel: 'blooio', messageId: 'consent-identity', app: 'ntwrk', memberId: 'owned-member', batchId,
       action: 'collect', commandSha256: digest(`collect ${batchId}`), networkAuthority: f.policy.authority, requestNonce: randomUUID() } };
   const http = await reviewHttp(undefined, undefined, f.policy);
@@ -858,7 +880,7 @@ test("membership context derives and signs only the current Network person witho
     expect(r.headers.get('cache-control')).toBe('no-store');
     expect(await svcVerify(httpSecret, { method: 'POST', path: LEARNING_CONSENT_CONTEXT_PATH, headers: r.headers, body: r.raw, nowS: Math.floor(now/1000) }))
       .toMatchObject({ ok: true, id: `${t.input.review.messageId}:learning-consent:${t.input.review.requestNonce}:proof` });
-    expect(parseLearningConsentContextProof(r.body, t.input, digest(r.requestRaw), now)).toMatchObject({ personId: owner.personId, app: owner.app, memberId: 'owned-member', expiresAt: now+30_000 });
+    expect(parseLearningConsentContextProof(r.body, t.input, digest(r.requestRaw), now)).toMatchObject({ personId: owner.personId, app: owner.app, memberId: 'owned-member', expiresAt: now+30_000, collectionExpiresAt: now+86_400_000 });
     expect(r.raw).not.toContain('+12125550100');
     expect(r.body).not.toHaveProperty('userId');
     expect(r.body).not.toHaveProperty('organizationId');
@@ -870,6 +892,24 @@ test("membership context derives and signs only the current Network person witho
     expect(second.status).toBe(200);
     expect(parseLearningConsentContextProof(second.body, t.input, digest(r.requestRaw), now)).toBeUndefined();
     expect(parseLearningConsentContextProof(r.body, { ...t.input, selectionSha256: digest('other selection') }, digest(r.requestRaw), now)).toBeUndefined();
+  } finally { await t.stop(); }
+});
+
+test("signed collection deadline uses the original Network arrival and stays fixed on another lookup", async () => {
+  const t = await contextFixture();
+  try {
+    const arrivedAt = now - 1234;
+    await sql`update platform.inbound set arrived_at=${new Date(arrivedAt)} where id='msg:blooio:consent-identity'`;
+    const first = await t.http.context(t.input);
+    expect(first.status).toBe(200);
+    expect(first.body.collectionExpiresAt).toBe(arrivedAt + 86_400_000);
+    expect(first.body.expiresAt).toBe(now + 30_000);
+    expect(parseLearningConsentContextProof(first.body, t.input, digest(first.requestRaw), now)).toBeDefined();
+    const second = await t.http.context({ ...t.input, review: { ...t.input.review, requestNonce: randomUUID() } });
+    expect(second.body.collectionExpiresAt).toBe(first.body.collectionExpiresAt);
+    const { collectionExpiresAt: _missing, ...missing } = first.body;
+    expect(parseLearningConsentContextProof(missing, t.input, digest(first.requestRaw), now)).toBeUndefined();
+    expect(parseLearningConsentContextProof({ ...first.body, collectionExpiresAt: now + 86_400_001 }, t.input, digest(first.requestRaw), now)).toBeUndefined();
   } finally { await t.stop(); }
 });
 
@@ -926,4 +966,154 @@ test("membership context refuses bans, holds and minors and caps proof at parent
     t.http.clock.advance(119_000);
     expect((await t.http.context(t.input)).body.expiresAt).toBe(now+120_000);
   } finally { await t.stop(); }
+});
+
+
+test("scoped collection endpoint enforces shared grammar and exact original scope through the owning SQL transaction", async () => {
+  const f = await ownerProofFixture();
+  const http = await reviewHttp(async () => ({ userId: owner.userId, organizationId: owner.organizationId, chatId: owner.chatId }), async () => true, f.policy);
+  try {
+    for (const [index, vector] of COLLECTION_COMMAND_VECTORS.entries()) {
+      const batchId = randomUUID(), text = vector.text.replaceAll("11111111-1111-4111-8111-111111111111", batchId);
+      const parsed = parseNetworkCollectionCommand(text);
+      const proposal = parsed?.kind === "collect" ? { ...input([{ ...candidate(), connectionId: randomUUID(), source: parsed.scope.sources[0]!, observedAt: parsed.scope.windowEnd - 1 }]),
+        windowStart: parsed.scope.windowStart, windowEnd: parsed.scope.windowEnd, timezone: parsed.scope.timezone,
+        allowedKinds: parsed.scope.fields, retainOnDisconnect: parsed.scope.retainAcceptedOnDisconnect } : input([{ ...candidate(), connectionId: randomUUID() }]);
+      const id = `scope-vector-${index}`;
+      await reviewCommandTurn(f, id, text);
+      const result = await http.post("collect", id, batchId, { text, proposal, networkAuthority: f.policy.authority });
+      expect(result.status).toBe(vector.kind === "collect" ? 200 : 400);
+      expect(await sql`select id from platform.profile_suggestion_batches where id=${batchId}`).toHaveLength(vector.kind === "collect" ? 1 : 0);
+    }
+    const batchId = randomUUID(), proposal = input([{ ...candidate(), connectionId: randomUUID() }]), text = collectionText(batchId, proposal);
+    await reviewCommandTurn(f, "scope-mismatch", text);
+    for (const changed of [{ windowStart: proposal.windowStart - 1 }, { windowEnd: proposal.windowEnd + 1 }, { timezone: "UTC" },
+      { retainOnDisconnect: true }, { allowedKinds: ["goal" as const], suggestions: [{ ...proposal.suggestions[0]!, kind: "goal" as const }] }, { expiresAt: now + 86_400_001 },
+      { suggestions: [{ ...proposal.suggestions[0]!, source: "google_calendar" as const }] }]) {
+      expect((await http.post("collect", "scope-mismatch", batchId, { text, proposal: { ...proposal, ...changed }, networkAuthority: f.policy.authority })).status).toBe(403);
+    }
+    // Retrying cannot reset retention to now+24h when the original turn is older.
+    await sql`update platform.inbound set arrived_at=${new Date(now - 60_000)} where id='msg:blooio:scope-mismatch'`;
+    expect((await http.post("collect", "scope-mismatch", batchId, { text, proposal: { ...proposal, expiresAt: now + 86_400_000 }, networkAuthority: f.policy.authority })).status).toBe(403);
+    expect(await sql`select id from platform.profile_suggestion_batches where id=${batchId}`).toHaveLength(0);
+  } finally { await http.stop(); f.stop(); }
+});
+
+test("consent context binds exact eight-key selection hash to stored scoped command and original fixed deadline", async () => {
+  const t = await contextFixture();
+  try {
+    const proposal = input(), text = collectionText(t.input.review.batchId, proposal);
+    await sql`update network.messages set body=${text} where id='in:blooio:consent-identity'`;
+    const selection: NetworkCollectionSelection = { sources: [{ source: "gmail", connectionId: randomUUID() }], windowStart: proposal.windowStart,
+      windowEnd: proposal.windowEnd, timezone: proposal.timezone, fields: proposal.allowedKinds, retainAcceptedOnDisconnect: false,
+      pendingExpiresAt: proposal.expiresAt, expiresAt: now + 86_400_000 };
+    const request: LearningConsentContextRequest = { ...t.input, review: { ...t.input.review, commandSha256: digest(text) },
+      selection, selectionSha256: await hashNetworkCollectionSelection(selection) };
+    expect((await t.http.context(request)).status).toBe(200);
+    // Exact entry marker may locate this scoped turn, but authorizes no selected scope.
+    const { selection: _selection, ...entryRequest } = request;
+    expect((await t.http.context({ ...entryRequest, selectionSha256: NETWORK_LEARNING_ENTRY_SELECTION_SHA256 })).status).toBe(200);
+    expect((await t.http.context({ ...entryRequest, selectionSha256: request.selectionSha256 })).status).toBe(403);
+    expect((await t.http.context({ ...request, selectionSha256: digest("different DTO") })).status).toBe(403);
+    for (const changed of [{ fields: ["goal" as const] }, { timezone: "UTC" }, { retainAcceptedOnDisconnect: true },
+      { sources: [{ source: "google_calendar" as const, connectionId: selection.sources[0]!.connectionId }] },
+      { pendingExpiresAt: now + 86_400_001 }, { expiresAt: now + 86_400_001 }, { windowStart: selection.windowStart - 1 }]) {
+      const altered = { ...selection, ...changed };
+      expect((await t.http.context({ ...request, selection: altered, selectionSha256: await hashNetworkCollectionSelection(altered) })).status).toBe(403);
+    }
+    expect((await t.http.context({ ...request, selection: { ...selection, personId: owner.personId } } as unknown as LearningConsentContextRequest)).status).toBe(400);
+    await sql`update platform.inbound set arrived_at=${new Date(now - 1000)} where id='msg:blooio:consent-identity'`;
+    expect((await t.http.context(request)).status).toBe(403);
+    expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(0);
+  } finally { await t.stop(); }
+});
+
+test("claimed collection store and Cloud owner independently refuse help, scope drift and widened retry expiry", async () => {
+  const f = await ownerProofFixture();
+  const batchId = randomUUID(), proposal = input(), text = collectionText(batchId, proposal);
+  try {
+    await reviewCommandTurn(f, "independent-collect", text);
+    const claim = { batchId, turnId: "msg:blooio:independent-collect", requestSha256: digest("independent envelope"), commandSha256: digest(text) };
+    let sourceCalls = 0;
+    const guarded = new ProfileSuggestions(sql, async () => { sourceCalls++; return true; });
+    expect(await guarded.propose(owner, { ...proposal, timezone: "UTC" }, now, claim)).toBeNull();
+    expect(sourceCalls).toBe(0);
+    const context: SuggestionTurnIdentity = { ...f.context, action: "collect", batchId, messageId: "independent-collect",
+      commandSha256: digest(text), pendingExpiresAt: proposal.expiresAt, collectionProposal: proposal };
+    expect(await f.read({ ...context, collectionProposal: { ...proposal, retainOnDisconnect: true } })).toBeNull();
+    expect(f.calls).toBe(0);
+    expect(await f.read(context)).toEqual({ ...f.identity, validUntil: now + 30_000 });
+    await sql`update network.messages set body=${`collect ${batchId}`} where id='in:blooio:independent-collect'`;
+    expect(await guarded.propose(owner, proposal, now, { ...claim, commandSha256: digest(`collect ${batchId}`) })).toBeNull();
+    expect(await f.read({ ...context, commandSha256: digest(`collect ${batchId}`) })).toBeNull();
+    await sql`update network.messages set body=${text} where id='in:blooio:independent-collect'`;
+    await sql`update platform.inbound set arrived_at=${new Date(now - 1000)} where id='msg:blooio:independent-collect'`;
+    expect(await guarded.propose(owner, { ...proposal, expiresAt: now + 86_400_000 }, now, claim)).toBeNull();
+    expect(sourceCalls).toBe(0);
+    expect(await sql`select id from platform.profile_suggestion_batches`).toHaveLength(0);
+  } finally { f.stop(); }
+});
+
+
+test("accepting Google profile intake preserves private provenance but cannot enter actual matcher input", async () => {
+  const batch = (await store.propose(owner, input([
+    { ...candidate(), scope: "matchable" },
+    { ...candidate(), source: "google_calendar", value: "I enjoy kayaking", tags: ["kayaking"], scope: "matchable" },
+    { ...candidate(), source: "gmail", value: "I enjoy camping", tags: ["camping"], scope: "agent_private" },
+  ]), now))!;
+  expect((await store.decide(owner, { batchId: batch.id, revision: batch.revision,
+    decisions: batch.suggestions.map(s => ({ suggestionId: s.id, action: "accept" as const, scope: s.scope })) }, now)).kind).toBe("saved");
+  const stored = await sql`select id,source,provenance,privacy_scope,status,value from network.facets where member_id='owned-member' order by source`;
+  expect(stored).toHaveLength(3);
+  expect(stored.every((f: any) => f.id.startsWith("source-suggestion:") && f.provenance === "inferred" && f.status === "confirmed")).toBe(true);
+  expect(stored.map((f: any) => f.privacy_scope).sort()).toEqual(["agent_private", "matchable", "matchable"]);
+  expect((await facets()).map(f => f.source).sort()).toEqual(["gmail", "gmail", "google_calendar"]);
+  expect((await facets()).every(f => (f as { learningPurpose?: string }).learningPurpose === "network_profile_learning_v1")).toBe(true);
+  // A normal member-stated fact is a positive control: the source fence must not erase unrelated eligibility.
+  await sql`insert into network.facets(id,app_id,member_id,kind,value,tags,privacy_scope,provenance,source,status)
+    values('member-stated-control','ntwrk','owned-member','interest','I enjoy hiking',array['hiking'],'matchable','said','chat','confirmed')`;
+  const matching = await loadSnapshot(sql, now, { app: "ntwrk" });
+  expect(matching.facets.map(f => f.id)).toEqual(["member-stated-control"]);
+  const world = buildWorld(matching, resolveConfig({}), localEmbed);
+  expect(world.input.facets.map(f => f.id)).toEqual(["member-stated-control"]);
+  expect(world.members.get("owned-member")?.match.map(f => f.id)).toEqual(["member-stated-control"]);
+  expect(world.members.get("owned-member")?.tags.has("climbing")).toBe(false);
+  expect(world.members.get("owned-member")?.tags.has("kayaking")).toBe(false);
+  expect(world.members.get("owned-member")?.tags.has("hiking")).toBe(true);
+  expect(await sql`select id from network.facets where source in ('gmail','google_calendar')`).toHaveLength(3);
+});
+
+
+test("Google intake cannot supply background bias or age-verification tags even after private acceptance", async () => {
+  const batch = (await store.propose(owner, input([{ ...candidate(), tags: ["verify:age:fail"], scope: "agent_private" }]), now))!;
+  expect((await store.decide(owner, { batchId: batch.id, revision: 1,
+    decisions: [{ suggestionId: batch.suggestions[0]!.id, action: "accept" }] }, now)).kind).toBe("saved");
+  const biasClock = new SimClock(now);
+  const service = new NetworkService({ url: `${base}/${db}`, clock: biasClock, env: { PLATFORM_ENV: "dev" },
+    networks: [{ id: "ntwrk:nyc" }], notify: false, log: () => {} });
+  try {
+    // Invoke the real background eligibility method against the same accepted stored fact.
+    const age = service as unknown as { verifiedAdult(personId: string, app: "ntwrk"): Promise<boolean> };
+    expect(await age.verifiedAdult(owner.personId, "ntwrk")).toBe(true);
+    await sql`insert into network.facets(id,app_id,member_id,kind,value,tags,privacy_scope,provenance,source,status)
+      values('staff-age-fail-control','ntwrk','owned-member','fact','age check failed',array['verify:age:fail'],'agent_private','said','chat','confirmed')`;
+    expect(await age.verifiedAdult(owner.personId, "ntwrk")).toBe(false);
+    await sql`delete from network.facets where id='staff-age-fail-control'`;
+    // Existing connected-source stores may contain derived appearance tags. The source-purpose
+    // fence must exclude these too, independently of today's collection tag-validator grammar.
+    await sql`update network.members set joined_at=${new Date(now - 2 * 86_400_000)} where id='owned-member'`;
+    const ratingTags = ['appearance:face=0.20','appearance:body=0.20','appearance:overall=0.20','appearance:conf=1.00'];
+    await sql`insert into network.facets(id,app_id,member_id,kind,value,tags,privacy_scope,provenance,source,status)
+      values('legacy-google-derived-control','ntwrk','owned-member','fact','connected source derived fact',${sql.array(ratingTags,"TEXT")},'agent_private','inferred','google_calendar','confirmed')`;
+    const runtime = service.runtimeFor("ntwrk")!;
+    const noGoogle = await service.weeklyBias(runtime, true);
+    expect(Object.keys(noGoogle!.report.groups)).toEqual(["unrated"]);
+    await sql`insert into network.facets(id,app_id,member_id,kind,value,tags,privacy_scope,provenance,source,status)
+      values('staff-appearance-control','ntwrk','owned-member','fact','staff rating',${sql.array(ratingTags,"TEXT")},'agent_private','said','chat','confirmed')`;
+    biasClock.advance(1);
+    const hasControl = await service.weeklyBias(runtime, true);
+    expect(Object.keys(hasControl!.report.groups)).toEqual(["q1"]);
+    expect(await sql`select id from network.facets where source in ('gmail','google_calendar')`).toHaveLength(2);
+    expect((await facets()).find(f => f.id.startsWith('source-suggestion:'))).toMatchObject({ source: 'gmail', scope: 'agent_private', confirmedByMember: true, learningPurpose: 'network_profile_learning_v1' });
+  } finally { await service.close(); }
 });

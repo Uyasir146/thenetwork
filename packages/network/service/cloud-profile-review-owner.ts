@@ -1,3 +1,4 @@
+import { collectionProposalMatchesStoredCommand } from "./profile-suggestions.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { isAppId } from "../../platform/src/apps.ts";
 import { PROFILE_REVIEW_OWNER_PATH as OWNER_PATH, parseProfileReviewOwnerRequest, parseProfileReviewOwnerProof } from "../../core/src/svc/profile-review-owner.ts";
@@ -41,7 +42,10 @@ export function cloudProfileReviewOwner(o: CloudProfileReviewOwnerOptions): Sugg
         || typeof turn.body !== "string" || sha256(turn.body) !== context.commandSha256) return null;
       // This narrows dispatch only; the canonical review parser still owns the exact decision.
       const command = turn.body.trim();
-      if (context.action === "preview" || context.action === "delete" || context.action === "collect") {
+      if (context.action === "collect") {
+        if (!context.collectionProposal || !collectionProposalMatchesStoredCommand(context.collectionProposal, turn.body, context.batchId, new Date(turn.arrived_at).getTime(), now)
+          || context.pendingExpiresAt !== context.collectionProposal.expiresAt) return null;
+      } else if (context.action === "preview" || context.action === "delete") {
         if (command !== `${context.action} ${context.batchId}`) return null;
       } else if (!["accept", "reject", "edit"].some(verb => command.startsWith(`${verb} ${context.batchId}.`))) return null;
       const arrivedAt = new Date(turn.arrived_at).getTime();

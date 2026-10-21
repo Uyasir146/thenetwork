@@ -1,3 +1,6 @@
+import { PROFILE_REVIEW_WITHDRAWAL_PROOF_PATH, parseProfileReviewWithdrawalRequest, parseProfileReviewWithdrawalProof, type ProfileReviewWithdrawalRequest, type ProfileReviewWithdrawalProof } from "../../core/src/svc/profile-review-withdrawal.ts";
+import { PROFILE_REVIEW_DISCONNECT_PROOF_PATH, parseProfileReviewDisconnectRequest, parseProfileReviewDisconnectProof } from "../../core/src/svc/profile-review-disconnect.ts";
+import type { SuggestionRevokedOwnerResolver } from "./profile-suggestion-disconnect-endpoint.ts";
 import { randomUUID } from "node:crypto";
 import type { SQL } from "bun";
 import { parseProfileReviewOwnerRequest } from "../../core/src/svc/profile-review-owner.ts";
@@ -14,9 +17,13 @@ interface TransactionReview {
   ownerUntil: number;
   sourceUntil: number;
 }
+export type SuggestionWithdrawalOwnerResolver = (request: ProfileReviewWithdrawalRequest, requestSha256: string) => Promise<ProfileReviewWithdrawalProof | null>;
+
 export interface ProfileReviewCallbacks {
   profileSuggestionIdentity: SuggestionIdentityResolver;
   profileSuggestionAuthorization: SuggestionAuthorization;
+  profileSuggestionRevokedOwner: SuggestionRevokedOwnerResolver;
+  profileSuggestionWithdrawalOwner: SuggestionWithdrawalOwnerResolver;
 }
 
 /** Binds source permission to the same database transaction's current canonical owner proof. */
@@ -28,7 +35,34 @@ export function profileReviewFactory(o: CloudProfileReviewOwnerOptions): Profile
     return transactions.get(tx) === entry && Number.isSafeInteger(now) && now < entry.ownerUntil && now < entry.sourceUntil
       && now < o.routePolicy.admitUntil && routeEnvelopeAllowed(o.routePolicy, entry.turn.networkAuthority, now);
   };
+  const revokedOwner: SuggestionRevokedOwnerResolver = async (request, requestSha256) => {
+    try {
+      const before = o.now();
+      if (!parseProfileReviewDisconnectRequest(request) || !/^[a-f0-9]{64}$/u.test(requestSha256)
+        || !Number.isSafeInteger(before) || before >= o.routePolicy.admitUntil) return null;
+      const result = await post(PROFILE_REVIEW_DISCONNECT_PROOF_PATH, `connection-cleanup:${request.requestNonce}`, { request, requestSha256 });
+      if (!result || result.now < before || result.now >= o.routePolicy.admitUntil) return null;
+      // The proof binds the original cleanup body hash, not the callback wrapper hash.
+      const proof = parseProfileReviewDisconnectProof(result.value, request, requestSha256, result.now);
+      return proof && proof.expiresAt <= o.routePolicy.admitUntil && o.now() >= result.now && o.now() < proof.expiresAt
+        && o.now() < o.routePolicy.admitUntil ? proof : null;
+    } catch { return null; }
+  };
+  const withdrawalOwner: SuggestionWithdrawalOwnerResolver = async (request, requestSha256) => {
+    try {
+      const before = o.now();
+      if (!parseProfileReviewWithdrawalRequest(request) || !/^[a-f0-9]{64}$/u.test(requestSha256)
+        || !Number.isSafeInteger(before) || before >= o.routePolicy.admitUntil) return null;
+      const result = await post(PROFILE_REVIEW_WITHDRAWAL_PROOF_PATH, `learning-withdrawal:${request.requestNonce}`, { request, requestSha256 });
+      if (!result || result.now < before || result.now >= o.routePolicy.admitUntil) return null;
+      const proof = parseProfileReviewWithdrawalProof(result.value, request, requestSha256, result.now);
+      return proof && proof.expiresAt <= o.routePolicy.admitUntil && o.now() >= result.now && o.now() < proof.expiresAt
+        && o.now() < o.routePolicy.admitUntil ? proof : null;
+    } catch { return null; }
+  };
   return {
+    profileSuggestionWithdrawalOwner: withdrawalOwner,
+    profileSuggestionRevokedOwner: revokedOwner,
     profileSuggestionIdentity: async (turn, tx) => {
       transactions.delete(tx);
       const bound = await identity(turn, tx);

@@ -1,10 +1,16 @@
+import { parseNetworkCollectionCommand, networkCollectionDeadline, NETWORK_COLLECTION_MAX_WINDOW_MS } from "../../core/src/svc/learning-collection-command.ts";
 import { createHash, randomUUID } from "node:crypto";
 import type { SQL } from "bun";
+import { parseProfileReviewWithdrawalProof, type ProfileReviewWithdrawalRequest,
+  type ProfileReviewWithdrawalProof } from "../../core/src/svc/profile-review-withdrawal.ts";
+import { parseProfileReviewDisconnectProof, parseProfileReviewDisconnectRequest,
+  type ProfileReviewDisconnectRequest, type ProfileReviewDisconnectProof } from "../../core/src/svc/profile-review-disconnect.ts";
 import { fold, isSensitiveTerm, type AppId } from "@thenetwork/core";
 
 /** These values come from authenticated server context, never an assistant's arguments. */
 export interface SuggestionOwner { userId: string; organizationId: string; personId: string; app: AppId; chatId: string }
 export interface SourceSuggestion {
+  /** Gmail message timestamp or Calendar event start, not the time the source was read. */
   connectionId: string; source: "gmail" | "google_calendar"; observedAt: number;
   kind: "interest" | "goal" | "availability_pattern"; value: string; tags: string[];
   confidence: number;
@@ -29,7 +35,17 @@ export interface SuggestionProposal {
   allowedKinds: SourceSuggestion["kind"][]; suggestions: SourceSuggestion[];
 }
 /** Internal server context, never inferred from a suggestion or a model-selected owner. */
-export interface SuggestionCollectionClaim { batchId: string; turnId: string; requestSha256: string }
+export interface SuggestionCollectionClaim { batchId: string; turnId: string; requestSha256: string; commandSha256?: string }
+/** Collection scope is authority only when it exactly matches the original explicit member turn. */
+export function collectionProposalMatchesStoredCommand(input: SuggestionProposal, text: string, batchId: string, arrivedAt: number, now: number): boolean {
+  const command = parseNetworkCollectionCommand(text), deadline = networkCollectionDeadline(arrivedAt, now);
+  if (command?.kind !== "collect" || command.batchId !== batchId || deadline === undefined) return false;
+  const s = command.scope;
+  return input.windowStart === s.windowStart && input.windowEnd === s.windowEnd && input.timezone === s.timezone
+    && JSON.stringify(input.allowedKinds) === JSON.stringify(s.fields) && input.retainOnDisconnect === s.retainAcceptedOnDisconnect
+    && Number.isSafeInteger(input.expiresAt) && input.expiresAt > now && input.expiresAt <= deadline
+    && input.suggestions.every(x => Number.isSafeInteger(x.observedAt) && s.sources.includes(x.source) && x.observedAt >= s.windowStart && x.observedAt < s.windowEnd);
+}
 const sensitive = (s: string) => (fold(s).match(/\p{L}+/gu) ?? []).some(isSensitiveTerm);
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const valueOK = (s: unknown): s is string => typeof s === "string" && s.trim().length >= 2 && s.length <= 400
@@ -91,7 +107,7 @@ export class ProfileSuggestions {
 
   async propose(owner: SuggestionOwner, input: SuggestionProposal, now: number, claim?: SuggestionCollectionClaim): Promise<SuggestionReviewBatch | null> {
     if (!Number.isFinite(now) || !Number.isFinite(input.windowStart) || !Number.isFinite(input.windowEnd)
-      || !(input.windowStart < input.windowEnd && input.expiresAt > now)
+      || !(input.windowStart < input.windowEnd && input.windowEnd - input.windowStart <= NETWORK_COLLECTION_MAX_WINDOW_MS && input.expiresAt > now)
       || !Number.isFinite(input.expiresAt) || typeof input.retainOnDisconnect !== "boolean"
       || !input.timezone || !input.allowedKinds.length || input.allowedKinds.some(k => !["interest", "goal", "availability_pattern"].includes(k))
       || input.suggestions.length < 1 || input.suggestions.length > 10) return null;
@@ -99,7 +115,8 @@ export class ProfileSuggestions {
     for (const s of input.suggestions) {
       if (!valueOK(s.value) || !input.allowedKinds.includes(s.kind)
         || !["gmail", "google_calendar"].includes(s.source) || !["agent_private", "matchable"].includes(s.scope)
-        || !Number.isFinite(s.observedAt) || s.observedAt > now
+        || !Number.isSafeInteger(s.observedAt) || s.observedAt < input.windowStart || s.observedAt >= input.windowEnd
+        || (s.source === "gmail" && s.observedAt > now)
         || !Number.isFinite(s.confidence) || s.confidence < 0 || s.confidence > 1
         || !s.connectionId || s.connectionId.length > 200
         || s.tags.length > 12 || s.tags.some(t => !/^[a-z][a-z0-9_:-]{0,79}$/u.test(t) || sensitive(t.replace(/[_:]/gu, " ")))) return null;
@@ -109,22 +126,29 @@ export class ProfileSuggestions {
     return this.sql.begin(async tx => {
       const member = await this.owned(tx, owner);
       if (!member?.eligible) return null;
+      // Verify stored explicit scope before consulting any source authorization.
+      const id = claim?.batchId ?? randomUUID();
+      let collectionTurn: any;
+      if (claim) {
+        [collectionTurn] = await tx`select i.response,i.action_receipts,i.request_hash,i.arrived_at,m.body
+          from platform.inbound i join platform.people p on p.phone_hash=i.sender_hash and p.id=${owner.personId}
+          join network.messages m on m.app_id=${owner.app} and m.member_id=${member.id} and m.id=${`in:${claim.turnId.slice(4)}`} and m.direction='inbound'
+          where i.id=${claim.turnId} and i.status='done' for update of i`;
+        if (collectionTurn?.response?.outcome !== 'open' || collectionTurn.response.app !== owner.app || collectionTurn.response.memberId !== member.id
+          || !/^[0-9a-f]{64}$/u.test(collectionTurn.request_hash ?? '') || typeof collectionTurn.body !== 'string'
+          || (claim.commandSha256 !== undefined && hash(collectionTurn.body) !== claim.commandSha256)
+          || !collectionProposalMatchesStoredCommand(input, collectionTurn.body, id, new Date(collectionTurn.arrived_at).getTime(), this.fence?.now() ?? now)) return null;
+      }
       for (const s of input.suggestions) if (!await this.authorize(owner, { connectionId: s.connectionId, source: s.source,
         windowStart: input.windowStart, windowEnd: input.windowEnd, timezone: input.timezone,
         allowedKinds: input.allowedKinds, retainOnDisconnect: input.retainOnDisconnect }, tx)) return null;
       this.checkAuthority({ expires_at: new Date(input.expiresAt) });
-      const id = claim?.batchId ?? randomUUID();
       const receiptKey = claim ? `profile-collect:${id}` : undefined;
       const inputSha256 = hash(JSON.stringify(input));
       if (claim) {
         // Existing inbound action receipts are the durable idempotency owner. Deleting a batch
         // never deletes this receipt, so replay cannot recreate erased private suggestions.
-        const [turn] = await tx`select i.response,i.action_receipts,i.request_hash,m.body
-          from platform.inbound i join platform.people p on p.phone_hash=i.sender_hash and p.id=${owner.personId}
-          join network.messages m on m.app_id=${owner.app} and m.member_id=${member.id} and m.id=${`in:${claim.turnId.slice(4)}`} and m.direction='inbound'
-          where i.id=${claim.turnId} and i.status='done' for update of i`;
-        if (turn?.response?.outcome !== 'open' || turn.response.app !== owner.app || turn.response.memberId !== member.id
-          || !/^[0-9a-f]{64}$/u.test(turn.request_hash ?? '') || turn.body !== `collect ${id}`) return null;
+        const turn = collectionTurn;
         const prior = turn.action_receipts?.[receiptKey!];
         if (prior) {
           if (prior.state !== 'completed' || prior.requestHash !== claim.requestSha256 || prior.response?.kind !== 'profile_collection'
@@ -248,6 +272,132 @@ export class ProfileSuggestions {
         await tx`update platform.profile_suggestion_batches set revision=revision+1 where id=${b.id}`;
       }
     });
+  }
+
+  /** Revocation cleanup never depends on an active source-read grant. Replay consumes no mutation. */
+  async applyRevokedConnection(owner: SuggestionOwner, request: ProfileReviewDisconnectRequest,
+    proof: ProfileReviewDisconnectProof, fence: () => boolean): Promise<{ pending: number; retainedAccepted: number; linkedFacts: number } | null> {
+    const denied = new Error("Revoked connection authority changed");
+    const valid = () => {
+      const now = this.fence?.now() ?? Date.now();
+      return !!this.authorizeOwner && fence() && !!parseProfileReviewDisconnectRequest(request)
+        && !!parseProfileReviewDisconnectProof(proof, request, proof.requestSha256, now)
+        && owner.personId === proof.personId && owner.app === proof.app && owner.userId === proof.userId
+        && owner.organizationId === proof.organizationId && owner.chatId === proof.chatId;
+    };
+    if (!valid()) return null;
+    try {
+      return await this.sql.begin(async tx => {
+        const member = await this.owned(tx, owner);
+        if (!member || member.id !== request.memberId || !valid()) return null;
+        // Global nonce uniqueness blocks cross-app replay too; conflict produces no receipt or mutation.
+        const receipt = await tx`insert into platform.profile_suggestion_connection_receipts
+          (request_nonce,request_hash,event_id,operation,app_id,person_id,member_id,user_id,organization_id,chat_id,connection_id,revoked_at)
+          values(${request.requestNonce},${proof.requestSha256},${request.revokedEventId},${request.operation},${owner.app},
+            ${owner.personId},${member.id},${owner.userId},${owner.organizationId},${owner.chatId},${request.connectionId},${new Date(proof.revokedAt)})
+          on conflict(request_nonce) do nothing returning request_nonce`;
+        if (!receipt.length) return null;
+        const batches = await tx`select id,retain_on_disconnect from platform.profile_suggestion_batches
+          where app_id=${owner.app} and person_id=${owner.personId} and member_id=${member.id}
+          and user_id=${owner.userId} and organization_id=${owner.organizationId} and chat_id=${owner.chatId}
+          and created_at<=${new Date(proof.revokedAt)} order by id for update`;
+        for (const batch of batches) {
+          const rows = await tx`select id,status,fact_id from platform.profile_suggestions
+            where app_id=${owner.app} and batch_id=${batch.id} and connection_id=${request.connectionId} order by id for update`;
+          let changed = false;
+          for (const row of rows) {
+            if (request.operation === "readback") continue;
+            if (request.operation === "disconnect" && row.status === "accepted" && batch.retain_on_disconnect) continue;
+            if (row.fact_id) await tx`delete from network.facets where id=${row.fact_id} and app_id=${owner.app} and member_id=${member.id}`;
+            if (request.operation === "delete") await tx`delete from platform.profile_suggestions where id=${row.id} and app_id=${owner.app} and batch_id=${batch.id}`;
+            else await tx`update platform.profile_suggestions set status='withdrawn',value=null,tags='{}',fact_id=null
+              where id=${row.id} and app_id=${owner.app} and batch_id=${batch.id}`;
+            changed = true;
+          }
+          if (changed) await tx`update platform.profile_suggestion_batches set revision=revision+1 where id=${batch.id} and app_id=${owner.app}`;
+        }
+        const [counts] = await tx`select count(*) filter(where s.status='proposed')::int as pending,
+          count(*) filter(where s.status='accepted' and b.retain_on_disconnect)::int as retained_accepted,
+          count(f.id)::int as linked_facts
+          from platform.profile_suggestion_batches b join platform.profile_suggestions s on s.batch_id=b.id and s.app_id=b.app_id
+          left join network.facets f on f.id=s.fact_id and f.app_id=b.app_id and f.member_id=b.member_id
+          where b.app_id=${owner.app} and b.person_id=${owner.personId} and b.member_id=${member.id}
+          and b.user_id=${owner.userId} and b.organization_id=${owner.organizationId} and b.chat_id=${owner.chatId}
+          and b.created_at<=${new Date(proof.revokedAt)} and s.connection_id=${request.connectionId}`;
+        // Throw to roll back nonce AND writes when a post-await canonical owner/fence check fails.
+        const finalMember = await this.owned(tx, owner);
+        if (!finalMember || finalMember.id !== request.memberId || !valid()) throw denied;
+        return { pending: Number(counts.pending), retainedAccepted: Number(counts.retained_accepted), linkedFacts: Number(counts.linked_facts) };
+      });
+    } catch (error) { if (error === denied) return null; throw error; }
+  }
+
+  /** Owner-intake withdrawal V2; no OAuth-revocation assertion and no active source read. */
+  async applyOwnerWithdrawal(owner: SuggestionOwner, request: ProfileReviewWithdrawalRequest,
+    proof: ProfileReviewWithdrawalProof, fence: () => boolean): Promise<{ pending: number; retainedAccepted: number; linkedFacts: number } | null> {
+    const denied = new Error("Owner withdrawal authority changed");
+    const valid = () => !!this.authorizeOwner && fence()
+      && !!parseProfileReviewWithdrawalProof(proof, request, proof.requestSha256, this.fence?.now() ?? Date.now())
+      && owner.personId === proof.personId && owner.app === proof.app && owner.userId === proof.userId
+      && owner.organizationId === proof.organizationId && owner.chatId === proof.chatId;
+    if (!valid()) return null;
+    try {
+      return await this.sql.begin(async tx => {
+        const member = await this.owned(tx, owner);
+        if (!member || member.id !== request.memberId || !valid()) return null;
+        const m = proof, turnId = `msg:${m.channel}:${m.messageId}`;
+        const receiptKey = `profile-withdrawal-v2:${request.withdrawalId}`;
+        const [turn] = await tx`select i.response,i.action_receipts,i.request_hash,i.arrived_at,msg.body
+          from platform.inbound i join platform.people p on p.phone_hash=i.sender_hash and p.id=${owner.personId}
+          join network.messages msg on msg.app_id=${owner.app} and msg.member_id=${member.id}
+            and msg.id=${`in:${m.channel}:${m.messageId}`} and msg.direction='inbound'
+          where i.id=${turnId} and i.status='done' for update of i,msg`;
+        if (!turn || turn.response?.outcome !== 'open' || turn.response.app !== owner.app || turn.response.memberId !== member.id
+          || !/^[a-f0-9]{64}$/u.test(turn.request_hash ?? '') || typeof turn.body !== 'string'
+          || hash(turn.body) !== m.commandSha256
+          || new Date(turn.arrived_at).getTime() > proof.cutoffAt
+          || !Number.isFinite(new Date(turn.arrived_at).getTime())) return null;
+        const receipts = turn.action_receipts ?? {};
+        if (request.operation !== 'readback' && (typeof receipts !== 'object' || Array.isArray(receipts) || Object.keys(receipts).length >= 16 || receipts[receiptKey])) return null;
+        // Person row is locked by owned(); same owner cannot race this cross-turn receipt check.
+        if (request.operation !== 'readback' && (await tx`select id from platform.inbound where jsonb_exists(action_receipts,${receiptKey}) limit 1`).length) return null;
+        const batches = await tx`select id from platform.profile_suggestion_batches where app_id=${owner.app}
+          and person_id=${owner.personId} and member_id=${member.id} and user_id=${owner.userId}
+          and organization_id=${owner.organizationId} and chat_id=${owner.chatId}
+          and created_at<=${new Date(proof.cutoffAt)} order by id for update`;
+        for (const batch of batches) {
+          const rows = await tx`select id,status,fact_id from platform.profile_suggestions where app_id=${owner.app}
+            and batch_id=${batch.id} and connection_id=${request.connectionId} order by id for update`;
+          let changed = false;
+          for (const row of rows) {
+            if (request.operation === 'readback' || (request.operation === 'withdraw' && row.status !== 'proposed')) continue;
+            if (request.operation === 'delete') {
+              if (row.fact_id) await tx`delete from network.facets where app_id=${owner.app} and member_id=${member.id} and id=${row.fact_id}`;
+              await tx`delete from platform.profile_suggestions where id=${row.id} and app_id=${owner.app} and batch_id=${batch.id}`;
+            } else {
+              await tx`update platform.profile_suggestions set status='withdrawn',value=null,tags='{}',fact_id=null
+                where id=${row.id} and app_id=${owner.app} and batch_id=${batch.id} and status='proposed'`;
+            }
+            changed = true;
+          }
+          if (changed) await tx`update platform.profile_suggestion_batches set revision=revision+1 where id=${batch.id} and app_id=${owner.app}`;
+        }
+        const [count] = await tx`select count(*) filter(where s.status='proposed')::int as pending,
+          count(*) filter(where s.status='accepted')::int as retained_accepted,count(f.id)::int as linked_facts
+          from platform.profile_suggestion_batches b join platform.profile_suggestions s on s.batch_id=b.id and s.app_id=b.app_id
+          left join network.facets f on f.id=s.fact_id and f.app_id=b.app_id and f.member_id=b.member_id
+          where b.app_id=${owner.app} and b.person_id=${owner.personId} and b.member_id=${member.id}
+          and b.user_id=${owner.userId} and b.organization_id=${owner.organizationId} and b.chat_id=${owner.chatId}
+          and b.created_at<=${new Date(proof.cutoffAt)} and s.connection_id=${request.connectionId}`;
+        if (request.operation !== 'readback') await tx`update platform.inbound set action_receipts=jsonb_set(action_receipts,array[${receiptKey}],
+          ${{ state: 'completed', version: 2, operation: request.operation, requestHash: proof.requestSha256,
+            withdrawalId: request.withdrawalId, requestNonce: request.requestNonce,
+            connectionId: request.connectionId, cutoffAt: proof.cutoffAt }}::jsonb) where id=${turnId}`;
+        const after = await this.owned(tx, owner);
+        if (!after || after.id !== request.memberId || !valid()) throw denied;
+        return { pending: Number(count.pending), retainedAccepted: Number(count.retained_accepted), linkedFacts: Number(count.linked_facts) };
+      });
+    } catch (error) { if (error === denied) return null; throw error; }
   }
 
   /** Internal tick cleanup; no owner needs to return to an expired preview. */

@@ -9,6 +9,13 @@ import { DAY, type Edge, type EdgeType, type Facet, type Intent, type Member, ty
 import type { SetStateRequest } from "../../core/src/svc/contract.ts";
 import { peonSeats } from "@thenetwork/engine";
 
+/** Static SQL-only purpose fence for automated inputs; never interpolate a caller-provided identifier. */
+export function automatedFacetPredicate(sql: SQL, memberJoin = false) {
+  return memberJoin
+    ? sql`(f.source is null or f.source not in ('gmail','google_calendar')) and f.id not like 'source-suggestion:%'`
+    : sql`(source is null or source not in ('gmail','google_calendar')) and id not like 'source-suggestion:%'`;
+}
+
 /** Effective participation comes from the canonical member row and Clock only. */
 export function effectiveParticipation(row: {participation_state: ParticipationState; participation_window?: unknown; opted_out?: boolean}, now: number): {
   state: ParticipationState; window: Pick<SetStateRequest,"state"|"from"|"until"|"note"> | null; active: boolean;
@@ -28,12 +35,15 @@ export function effectiveParticipation(row: {participation_state: ParticipationS
 const CORE_EDGES = new Set<EdgeType>(["invited_by", "vouched_for", "knows", "met", "introduced", "helped", "hosted", "enjoyed", "would_interact_again", "group_only", "avoid", "blocked"]);
 const ms = (d: Date | string | null | undefined) => (d ? new Date(d).getTime() : undefined);
 
-export function facetOf(r: any): Facet {
+/** Durable source-suggestion IDs identify accepted profile-learning purpose without changing privacy scope. */
+export function facetOf(r: any): Facet & { learningPurpose?: "network_profile_learning_v1" } {
   return {
     id: r.id, memberId: r.member_id, kind: r.kind, value: r.value, tags: r.tags ?? [], scope: r.privacy_scope, provenance: r.provenance,
     confidence: r.confidence, validFrom: ms(r.valid_from), validTo: ms(r.valid_to), ...(r.source ? { source: r.source } : {}),
     ...(r.sensitive ? { sensitive: r.sensitive } : {}), ...(r.provenance === "inferred" ? { inferred: true } : {}),
     ...(r.observed_at ? { observedAt: ms(r.observed_at) } : {}), confirmedByMember: r.status === "confirmed",
+    ...(typeof r.id === "string" && r.id.startsWith("source-suggestion:") && ["gmail", "google_calendar"].includes(r.source)
+      ? { learningPurpose: "network_profile_learning_v1" as const } : {}),
   };
 }
 
@@ -49,10 +59,14 @@ export function presenceOf(r: any): Presence {
 }
 
 /** App isolation always applies. Runtime conversation ownership names homeCities; other readers may use physical city/presence scope. */
-export interface SnapshotScope { app: string; city?: string; homeCities?: readonly string[] }
+export interface SnapshotScope { app: string; city?: string; homeCities?: readonly string[];
+  /** Internal owned profile review only. Default snapshots feed matching/background work and exclude deferred Google intake. */
+  purpose?: "profile_review";
+}
 
 /**
  * The engine's and the Network's input at `now`, for one app (platform plan 2.4: nothing crosses apps).
+ * Default facet input excludes deferred Google learning even after member acceptance; owned profile-review reads are explicit.
  * Every query filters by app_id. Members who are invited (not joined yet) or removed (declined at
  * join, or left) are left out. A missing age stays undefined, which the Network treats as unknown (a
  * minor until the member says otherwise). An opted-out member reads as "paused". Each member carries
@@ -69,7 +83,11 @@ export async function loadSnapshot(sql: SQL, now: number, scope: SnapshotScope =
   const app = scope.app;
   const [members, facets, intents, presence, edges, recent, parts, personBlocks] = await Promise.all([
     sql`select * from network.members where app_id = ${app} and account_status not in ('invited', 'removed') order by id`,
-    sql`select * from network.facets where app_id = ${app} and status <> 'rejected' order by member_id, id`,
+    // Acceptance authorizes private intake, not matching or downstream automated use. Privacy scope is independent.
+    scope.purpose === 'profile_review'
+      ? sql`select * from network.facets where app_id = ${app} and status <> 'rejected' order by member_id, id`
+      : sql`select * from network.facets where app_id = ${app} and status <> 'rejected'
+          and ${automatedFacetPredicate(sql)} order by member_id, id`,
     sql`select * from network.intents where app_id = ${app} order by member_id, id`,
     sql`select * from network.presence where app_id = ${app} order by member_id, city, type`,
     sql`select * from network.edges where app_id = ${app} order by from_id, to_id, type`,

@@ -1,9 +1,10 @@
+import { parseNetworkCollectionCommand, hashNetworkCollectionSelection, networkCollectionDeadline } from "../../core/src/svc/learning-collection-command.ts";
 import { createHash } from "node:crypto";
 import type { SQL } from "bun";
 import { readCapped } from "../../platform/src/body.ts";
 import { resolveConsent } from "../../platform/src/consent.ts";
 import { svcSign, svcVerify } from "../../core/src/svc/svc-auth.ts";
-import { LEARNING_CONSENT_CONTEXT_PATH, parseLearningConsentContextRequest, type LearningConsentContextProof } from "../../core/src/svc/learning-consent-context.ts";
+import { LEARNING_CONSENT_CONTEXT_PATH, parseLearningConsentContextRequest, type LearningConsentContextProof, NETWORK_LEARNING_ENTRY_SELECTION_SHA256, learningSelectionMatchesStoredCommand } from "../../core/src/svc/learning-consent-context.ts";
 import { routeEnvelopeAllowed, type NetworkRoutePolicy } from "./route-authority.ts";
 
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { "Cache-Control": "no-store" } });
@@ -58,7 +59,14 @@ export async function learningConsentContextEndpoint(d: { sql: SQL; now: () => n
       if (!turn || !/^[a-f0-9]{64}$/u.test(turn.request_hash ?? '') || turn.response?.outcome !== 'open'
         || turn.response.app !== review.app || turn.response.memberId !== review.memberId || !Number.isSafeInteger(arrivedAt)
         || arrivedAt > d.now() || d.now() >= arrivedAt + 300_000 || !routeEnvelopeAllowed(policy, turn.network_authority, d.now())
-        || turn.body !== `collect ${review.batchId}` || createHash('sha256').update(turn.body).digest('hex') !== review.commandSha256) return json({ error: "turn_scope_invalid" }, 403);
+        || typeof turn.body !== 'string' || createHash('sha256').update(turn.body).digest('hex') !== review.commandSha256) return json({ error: "turn_scope_invalid" }, 403);
+      const command = parseNetworkCollectionCommand(turn.body);
+      if (!command || command.batchId !== review.batchId) return json({ error: 'turn_scope_invalid' }, 403);
+      if (request.selection === undefined) {
+        // The exact Auth655 marker retains an entry lookup only; it grants no selected scope.
+        if (request.selectionSha256 !== NETWORK_LEARNING_ENTRY_SELECTION_SHA256) return json({ error: 'turn_scope_invalid' }, 403);
+      } else if (!learningSelectionMatchesStoredCommand(request.selection, turn.body, review.batchId, arrivedAt, d.now())
+        || await hashNetworkCollectionSelection(request.selection) !== request.selectionSha256 || !current()) return json({ error: 'turn_scope_invalid' }, 403);
       // STOP is canonical even when a delayed projection has not reached the member row yet.
       // Never choose the newest of several identities: that could read another number's STOP ledger.
       const phones = await tx`select e164 from platform.phone_identities where person_id=${candidate.id} limit 2 for share`;
@@ -71,12 +79,14 @@ export async function learningConsentContextEndpoint(d: { sql: SQL; now: () => n
         return resolveConsent({ app: event(review.app), global: event(null) }) === 'opted_out';
       };
       if (await optedOut() || !current()) return json({ error: "turn_scope_invalid" }, 403);
-      const issuedAt = d.now(), expiresAt = Math.min(issuedAt + 30_000, arrivedAt + 300_000, policy!.admitUntil);
+      const issuedAt = d.now(), collectionExpiresAt = networkCollectionDeadline(arrivedAt, issuedAt);
+      if (collectionExpiresAt === undefined) return json({ error: "turn_scope_invalid" }, 403);
+      const expiresAt = Math.min(issuedAt + 30_000, arrivedAt + 300_000, collectionExpiresAt, policy!.admitUntil, request.selection?.pendingExpiresAt ?? Infinity, request.selection?.expiresAt ?? Infinity);
       if (expiresAt <= issuedAt) return json({ error: "turn_scope_invalid" }, 403);
       const proof: LearningConsentContextProof = { version: 1, purpose: 'network-learning-membership-v1', requestSha256: createHash('sha256').update(raw).digest('hex'),
         requestNonce: review.requestNonce, channel: review.channel, messageId: review.messageId, commandSha256: review.commandSha256,
         networkAuthority: review.networkAuthority, personId: candidate.id, app: review.app, memberId: review.memberId,
-        selectionSha256: request.selectionSha256, issuedAt, expiresAt };
+        selectionSha256: request.selectionSha256, collectionExpiresAt, issuedAt, expiresAt };
       const body = JSON.stringify(proof);
       const headers = await svcSign(d.secret!, { method: 'POST', path: LEARNING_CONSENT_CONTEXT_PATH, id: `${id}:proof`, body, nowS: Math.floor(d.now() / 1000) });
       // addConsent can append without taking the person lock. Re-read after asynchronous signing;

@@ -1,3 +1,8 @@
+import { PROFILE_REVIEW_WITHDRAWAL_PATH, parseProfileReviewWithdrawalProof } from "../../core/src/svc/profile-review-withdrawal.ts";
+import { profileSuggestionWithdrawalEndpoint } from "./profile-suggestion-withdrawal-endpoint.ts";
+import type { SuggestionWithdrawalOwnerResolver } from "./profile-review-factory.ts";
+import { PROFILE_REVIEW_DISCONNECT_PATH, parseProfileReviewDisconnectProof } from "../../core/src/svc/profile-review-disconnect.ts";
+import { profileSuggestionDisconnectEndpoint, type SuggestionRevokedOwnerResolver } from "./profile-suggestion-disconnect-endpoint.ts";
 // The production runtime of the Network for every app (README.md in this folder; platform plan 4.4, 6.1).
 //  - One process holds one NetworkRuntime per row of platform.networks ('<app>:<city>'). Each runtime
 //    ticks and handles units of work under its own PgStore advisory lock (runtime.ts).
@@ -32,7 +37,7 @@ import { brandOf, copy as ntwrkCopy, copyFor, ELIZA_NOTICE, type Copy } from "..
 import { isMinor } from "@thenetwork/core";
 import { ageAnswer, agesStated } from "../src/classify.ts";
 import { NetworkRuntime, type RuntimeHost } from "./runtime.ts";
-import { effectiveParticipation } from "./snapshot.ts";
+import { effectiveParticipation, automatedFacetPredicate } from "./snapshot.ts";
 import { ProfileSuggestions, type SuggestionAuthorization } from "./profile-suggestions.ts";
 import { profileReviewFromEnv } from "./profile-review-factory.ts";
 import { Inbox, type CollectedReply } from "./inbox.ts";
@@ -139,6 +144,8 @@ export interface ServiceOptions {
   /** Optional trusted source-consent check; imports and promotions default to denied. */
   profileSuggestionIdentity?: SuggestionIdentityResolver;
   profileSuggestionAuthorization?: SuggestionAuthorization;
+  profileSuggestionRevokedOwner?: SuggestionRevokedOwnerResolver;
+  profileSuggestionWithdrawalOwner?: SuggestionWithdrawalOwnerResolver;
   /** Postgres with the `network` and `platform` schemas (a login that can read and write them). */
   url: string;
   /** The networks to run (platform.networks rows; NetworkService.fromDatabase reads them). Default: one, `id`. */
@@ -260,6 +267,8 @@ export class NetworkService implements RuntimeHost {
   readonly profileSuggestions: ProfileSuggestions;
   private readonly suggestionIdentity?: SuggestionIdentityResolver;
   private readonly suggestionAuthorization?: SuggestionAuthorization;
+  private readonly suggestionRevokedOwner?: SuggestionRevokedOwnerResolver;
+  private readonly suggestionWithdrawalOwner?: SuggestionWithdrawalOwnerResolver;
   readonly clock: Clock;
   readonly instance: string;
   readonly audit: AuditSink;
@@ -337,6 +346,8 @@ export class NetworkService implements RuntimeHost {
     const profileReview = profileReviewFromEnv(this.env, () => this.clock.now());
     this.suggestionIdentity = o.profileSuggestionIdentity ?? profileReview.profileSuggestionIdentity;
     this.suggestionAuthorization = o.profileSuggestionAuthorization ?? profileReview.profileSuggestionAuthorization;
+    this.suggestionRevokedOwner = o.profileSuggestionRevokedOwner ?? profileReview.profileSuggestionRevokedOwner;
+    this.suggestionWithdrawalOwner = o.profileSuggestionWithdrawalOwner ?? profileReview.profileSuggestionWithdrawalOwner;
     this.profileSuggestions = new ProfileSuggestions(this.sql, this.suggestionAuthorization ?? (async () => false));
     this.people = o.people ?? new PgPeopleStore(this.sql);
     this.cost = new CostLedger({ sink: new PgCostSink(this.sql), clock: this.clock, rates: costRatesFromEnv(this.env), log: this.log });
@@ -474,7 +485,7 @@ export class NetworkService implements RuntimeHost {
     const [last] = await rt.scoped(tx => tx`select max(at) as at from network.bias_reports where app_id = ${rt.app.id} and network_id = ${rt.id}`);
     if (!force && last?.at && now - new Date(last.at as string).getTime() < BIAS_EVERY_MS) return undefined;
     const rows = await rt.scoped(tx => tx`select m.id, m.age, m.joined_at, coalesce(array_agg(t) filter (where t like 'appearance:%'), '{}') as tags
-      from network.members m left join network.facets f on f.app_id = m.app_id and f.member_id = m.id and f.status <> 'rejected' left join lateral unnest(f.tags) t on true
+      from network.members m left join network.facets f on f.app_id = m.app_id and f.member_id = m.id and f.status <> 'rejected' and ${automatedFacetPredicate(tx, true)} left join lateral unnest(f.tags) t on true
       where m.app_id = ${rt.app.id} and m.account_status in ('active', 'paused', 'restricted') group by m.id, m.age, m.joined_at order by m.id`) as any[];
     const members: BiasMember[] = rows.map(r => ({ id: r.id, age: r.age, joinedAt: r.joined_at ? new Date(r.joined_at).getTime() : null, tags: r.tags ?? [] }));
     const r = biasReport(rt.id, rt.app.id, members, [...rt.net.opps.values()], now);
@@ -1472,7 +1483,7 @@ export class NetworkService implements RuntimeHost {
     const m = await this.people.getMembership(personId, app);
     const rt = this.runtimeFor(app);
     if (!m || !rt || !["active", "paused", "onboarding"].includes(m.state)) return false;
-    const rows = await rt.scoped(tx => tx`select m.age, f.tags, f.valid_from from network.members m left join network.facets f on f.app_id = m.app_id and f.member_id = m.id and f.status <> 'rejected'
+    const rows = await rt.scoped(tx => tx`select m.age, f.tags, f.valid_from from network.members m left join network.facets f on f.app_id = m.app_id and f.member_id = m.id and f.status <> 'rejected' and ${automatedFacetPredicate(tx, true)}
       and exists (select 1 from unnest(f.tags) t where t like 'verify:age:%') where m.app_id = ${app} and m.id = ${m.memberId} order by f.valid_from desc nulls last, f.id desc`) as any[];
     if (!rows.length || !(rows[0].age >= 18)) return false;
     // Founder decision 9 (AGENTS.md): no ID check; the stated age (18+ on the person and the member) is
@@ -2009,6 +2020,59 @@ export class NetworkService implements RuntimeHost {
   fetch = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
     if (url.pathname === LEARNING_CONSENT_CONTEXT_PATH) return learningConsentContextEndpoint({ sql: this.sql, now: () => this.clock.now(), secret: this.env.SERVICE_TURN_SECRET, routePolicy: this.routePolicy }, req);
+    if (url.pathname === PROFILE_REVIEW_WITHDRAWAL_PATH) {
+      const resolver = this.suggestionWithdrawalOwner;
+      const current = () => Number.isSafeInteger(this.clock.now()) && !!this.routePolicy && this.clock.now() < this.routePolicy.admitUntil;
+      if (!resolver || !current()) return json({ error: "cleanup_unavailable" }, 503);
+      return profileSuggestionWithdrawalEndpoint(req, {
+        secret: this.env.SERVICE_TURN_SECRET ?? "", now: () => this.clock.now(), valid: current,
+        resolveWithdrawalOwner: resolver,
+        applyOwnerWithdrawal: async (owner, request, proof, fence) => {
+          let currentProof = proof;
+          const valid = () => fence() && current() && this.clock.now() >= currentProof.issuedAt && this.clock.now() < currentProof.expiresAt;
+          const withdrawalStore = new ProfileSuggestions(this.sql, async () => false, async (who, tx) => {
+            if (!valid()) return false;
+            const [turn] = await tx`select network_authority from platform.inbound where id=${`msg:${proof.channel}:${proof.messageId}`} and status='done'`;
+            if (!turn || !routeEnvelopeAllowed(this.routePolicy, turn.network_authority, this.clock.now())) return false;
+            const response = await resolver(request, proof.requestSha256);
+            const refreshed = parseProfileReviewWithdrawalProof(response, request, proof.requestSha256, this.clock.now());
+            if (!refreshed || !valid() || refreshed.cutoffAt !== proof.cutoffAt
+              || refreshed.channel !== proof.channel || refreshed.messageId !== proof.messageId || refreshed.commandSha256 !== proof.commandSha256
+              || refreshed.userId !== proof.userId || refreshed.organizationId !== proof.organizationId || refreshed.chatId !== proof.chatId
+              || who.personId !== refreshed.personId || who.app !== refreshed.app || who.userId !== refreshed.userId
+              || who.organizationId !== refreshed.organizationId || who.chatId !== refreshed.chatId) return false;
+            currentProof = refreshed;
+            return valid() && routeEnvelopeAllowed(this.routePolicy, turn.network_authority, this.clock.now());
+          }, { now: () => this.clock.now(), valid });
+          return withdrawalStore.applyOwnerWithdrawal(owner, request, proof, valid);
+        },
+      });
+    }
+    if (url.pathname === PROFILE_REVIEW_DISCONNECT_PATH) {
+      const resolver = this.suggestionRevokedOwner;
+      const current = () => Number.isSafeInteger(this.clock.now()) && !!this.routePolicy && this.clock.now() < this.routePolicy.admitUntil;
+      if (!resolver || !current()) return json({ error: "cleanup_unavailable" }, 503);
+      return profileSuggestionDisconnectEndpoint(req, {
+        secret: this.env.SERVICE_TURN_SECRET ?? "", now: () => this.clock.now(), valid: current,
+        resolveRevokedOwner: resolver,
+        applyRevokedConnection: async (owner, request, proof, fence) => {
+          let currentProof = proof;
+          const valid = () => fence() && current() && this.clock.now() >= currentProof.issuedAt && this.clock.now() < currentProof.expiresAt;
+          const revokedStore = new ProfileSuggestions(this.sql, async () => false, async (who) => {
+            if (!valid()) return false;
+            const response = await resolver(request, proof.requestSha256);
+            const refreshed = parseProfileReviewDisconnectProof(response, request, proof.requestSha256, this.clock.now());
+            if (!refreshed || !valid() || refreshed.revokedAt !== proof.revokedAt
+              || refreshed.userId !== proof.userId || refreshed.organizationId !== proof.organizationId || refreshed.chatId !== proof.chatId
+              || who.personId !== refreshed.personId || who.app !== refreshed.app || who.userId !== refreshed.userId
+              || who.organizationId !== refreshed.organizationId || who.chatId !== refreshed.chatId) return false;
+            currentProof = refreshed;
+            return valid();
+          }, { now: () => this.clock.now(), valid });
+          return revokedStore.applyRevokedConnection(owner, request, proof, valid);
+        },
+      });
+    }
     if (url.pathname.startsWith(SUGGESTION_PATH)) return profileSuggestionEndpoint({ sql: this.sql, now: () => this.clock.now(), secret: this.env.SERVICE_TURN_SECRET, routePolicy: this.routePolicy, resolveIdentity: this.suggestionIdentity, authorizeSource: this.suggestionAuthorization }, req);
     if ([TURN_PATH, TURN_RECEIPT_PATH, SET_STATE_PATH, SIGNALS_PATH, UPDATES_PATH].includes(url.pathname)) return this.sharedTurn(req);
     if (url.pathname === RELAY_PATH) return relayEndpoint({ sql: this.sql, clock: this.clock, secret: this.env.SERVICE_TURN_SECRET, routePolicy: this.routePolicy, accounts: this.accounts, runtimeFor: app => this.runtimeFor(app), runtimeOfMember: (app, memberId) => this.runtimeOfMember(app, memberId), ...(this.relayHookFor ? { hookFor: this.relayHookFor } : {}) }, req);
