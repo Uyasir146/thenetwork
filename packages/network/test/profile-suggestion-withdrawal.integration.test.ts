@@ -78,7 +78,7 @@ test("V2 withdrawal removes pending intake only and keeps accepted facts regardl
     const request=f.request();expect((await f.post(request)).body).toEqual({kind:'owner_withdrawal',operation:'withdraw',counts:{pending:0,retainedAccepted:2,linkedFacts:2}});
     expect(f.activeSourceCalls).toBe(0);expect(await sql`select id from network.facets`).toHaveLength(2);
     expect((await sql`select status from platform.profile_suggestions where batch_id=${newer.id}`)[0].status).toBe('proposed');
-    expect((await f.post(request)).status).toBe(403);
+    expect((await f.post(request)).body).toEqual({kind:'owner_withdrawal',operation:'withdraw',counts:{pending:0,retainedAccepted:2,linkedFacts:2}});
     expect((await f.post({...request,requestNonce:randomUUID()})).status).toBe(403);
     const before=await sql`select id,action_receipts from platform.inbound order by id`;
     const read=f.request('readback');await f.prepare(read);const beforeRead=await sql`select id,action_receipts from platform.inbound order by id`;

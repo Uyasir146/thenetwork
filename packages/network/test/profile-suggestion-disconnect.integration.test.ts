@@ -96,7 +96,7 @@ test("revoked cleanup uses real SQL with active-source authorization false and l
     expect((await sql`select status from platform.profile_suggestions where batch_id=${newer.id}`)[0].status).toBe("accepted");
     expect(await sql`select id from network.facets`).toHaveLength(2);
     expect(await sql`select request_hash from platform.profile_suggestion_connection_receipts where request_nonce=${request.requestNonce}`).toEqual([expect.objectContaining({ request_hash: result.requestHash })]);
-    expect((await f.post(request)).status).toBe(403);
+    expect((await f.post(request)).body).toEqual(result.body);
     expect(await sql`select request_nonce from platform.profile_suggestion_connection_receipts`).toHaveLength(1);
     const readback = await f.post(f.request("readback")); expect(readback.status).toBe(200);
     expect(readback.body.counts).toEqual({ pending: 0, retainedAccepted: 1, linkedFacts: 1 });

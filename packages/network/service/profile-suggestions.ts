@@ -53,6 +53,15 @@ const valueOK = (s: unknown): s is string => typeof s === "string" && s.trim().l
   && !/(?:https?:\/\/|\b[^\s@]+@[^\s@]+\.[^\s@]+|\+?\d[\d ().-]{7,}\d)/u.test(s)
   && !sensitive(s);
 
+/** Decode only a complete stored result. Never reconstruct an earlier response from current profile state. */
+function completedCleanupCounts(value: unknown): { pending: number; retainedAccepted: number; linkedFacts: number } | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const v = value as Record<string, unknown>;
+  if (Object.keys(v).sort().join() !== "linkedFacts,pending,retainedAccepted"
+    || ![v.pending, v.retainedAccepted, v.linkedFacts].every(n => Number.isSafeInteger(n) && (n as number) >= 0)) return undefined;
+  return { pending: v.pending as number, retainedAccepted: v.retainedAccepted as number, linkedFacts: v.linkedFacts as number };
+}
+
 /** Private review storage; only accepted values enter the existing canonical facet table. */
 export class ProfileSuggestions {
   constructor(private readonly sql: SQL, private readonly authorize: SuggestionAuthorization,
@@ -290,13 +299,23 @@ export class ProfileSuggestions {
       return await this.sql.begin(async tx => {
         const member = await this.owned(tx, owner);
         if (!member || member.id !== request.memberId || !valid()) return null;
-        // Global nonce uniqueness blocks cross-app replay too; conflict produces no receipt or mutation.
-        const receipt = await tx`insert into platform.profile_suggestion_connection_receipts
-          (request_nonce,request_hash,event_id,operation,app_id,person_id,member_id,user_id,organization_id,chat_id,connection_id,revoked_at)
-          values(${request.requestNonce},${proof.requestSha256},${request.revokedEventId},${request.operation},${owner.app},
-            ${owner.personId},${member.id},${owner.userId},${owner.organizationId},${owner.chatId},${request.connectionId},${new Date(proof.revokedAt)})
-          on conflict(request_nonce) do nothing returning request_nonce`;
-        if (!receipt.length) return null;
+        // Receipts are append-only; person/member locks serialize same-owner retries.
+        // Do not request FOR UPDATE here: the runtime role intentionally has SELECT/INSERT only.
+        const [previous] = await tx`select * from platform.profile_suggestion_connection_receipts where request_nonce=${request.requestNonce}`;
+        if (previous) {
+          const stored = previous.result;
+          const counts = stored && typeof stored === 'object' && !Array.isArray(stored)
+            && Object.keys(stored).sort().join() === 'counts,purpose,version'
+            && stored.version === 1 && stored.purpose === 'network-profile-review-revoked-owner-v1'
+            ? completedCleanupCounts(stored.counts) : undefined;
+          if (!counts || previous.request_hash !== proof.requestSha256 || previous.event_id !== request.revokedEventId
+            || previous.operation !== request.operation || previous.app_id !== owner.app || previous.person_id !== owner.personId
+            || previous.member_id !== request.memberId || previous.user_id !== owner.userId || previous.organization_id !== owner.organizationId
+            || previous.chat_id !== owner.chatId || previous.connection_id !== request.connectionId
+            || new Date(previous.revoked_at).getTime() !== proof.revokedAt) return null;
+          const current = await this.owned(tx, owner);
+          return current && current.id === request.memberId && valid() ? counts : null;
+        }
         const batches = await tx`select id,retain_on_disconnect from platform.profile_suggestion_batches
           where app_id=${owner.app} and person_id=${owner.personId} and member_id=${member.id}
           and user_id=${owner.userId} and organization_id=${owner.organizationId} and chat_id=${owner.chatId}
@@ -324,10 +343,19 @@ export class ProfileSuggestions {
           where b.app_id=${owner.app} and b.person_id=${owner.personId} and b.member_id=${member.id}
           and b.user_id=${owner.userId} and b.organization_id=${owner.organizationId} and b.chat_id=${owner.chatId}
           and b.created_at<=${new Date(proof.revokedAt)} and s.connection_id=${request.connectionId}`;
-        // Throw to roll back nonce AND writes when a post-await canonical owner/fence check fails.
+        const result = { pending: Number(counts.pending), retainedAccepted: Number(counts.retained_accepted), linkedFacts: Number(counts.linked_facts) };
+        // Publish completion with its original result in the same transaction as the mutations.
+        const receipt = await tx`insert into platform.profile_suggestion_connection_receipts
+          (request_nonce,request_hash,event_id,operation,app_id,person_id,member_id,user_id,organization_id,chat_id,connection_id,revoked_at,result)
+          values(${request.requestNonce},${proof.requestSha256},${request.revokedEventId},${request.operation},${owner.app},
+            ${owner.personId},${member.id},${owner.userId},${owner.organizationId},${owner.chatId},${request.connectionId},${new Date(proof.revokedAt)},
+            ${{ version: 1, purpose: 'network-profile-review-revoked-owner-v1', counts: result }}::jsonb)
+          on conflict(request_nonce) do nothing returning request_nonce`;
+        // Cross-owner/app nonce conflicts must roll back mutations, never commit via return null.
+        if (!receipt.length) throw denied;
         const finalMember = await this.owned(tx, owner);
         if (!finalMember || finalMember.id !== request.memberId || !valid()) throw denied;
-        return { pending: Number(counts.pending), retainedAccepted: Number(counts.retained_accepted), linkedFacts: Number(counts.linked_facts) };
+        return result;
       });
     } catch (error) { if (error === denied) return null; throw error; }
   }
@@ -358,9 +386,27 @@ export class ProfileSuggestions {
           || new Date(turn.arrived_at).getTime() > proof.cutoffAt
           || !Number.isFinite(new Date(turn.arrived_at).getTime())) return null;
         const receipts = turn.action_receipts ?? {};
-        if (request.operation !== 'readback' && (typeof receipts !== 'object' || Array.isArray(receipts) || Object.keys(receipts).length >= 16 || receipts[receiptKey])) return null;
-        // Person row is locked by owned(); same owner cannot race this cross-turn receipt check.
-        if (request.operation !== 'readback' && (await tx`select id from platform.inbound where jsonb_exists(action_receipts,${receiptKey}) limit 1`).length) return null;
+        if (typeof receipts !== 'object' || Array.isArray(receipts)) return null;
+        const identity = { state: 'completed', version: 2, purpose: 'network-profile-review-withdrawal-v2', operation: request.operation,
+          requestHash: proof.requestSha256, withdrawalId: request.withdrawalId, requestNonce: request.requestNonce,
+          connectionId: request.connectionId, cutoffAt: proof.cutoffAt, app: owner.app, personId: owner.personId,
+          memberId: request.memberId, userId: owner.userId, organizationId: owner.organizationId, chatId: owner.chatId,
+          channel: m.channel, messageId: m.messageId, commandSha256: m.commandSha256, inboundRequestHash: turn.request_hash };
+        if (request.operation !== 'readback') {
+          const previous = receipts[receiptKey];
+          if (previous !== undefined) {
+            const counts = previous && typeof previous === 'object' && !Array.isArray(previous)
+              && Object.keys(previous).length === Object.keys(identity).length + 1
+              && Object.entries(identity).every(([key, value]) => previous[key] === value)
+              ? completedCleanupCounts(previous.result) : undefined;
+            if (!counts) return null;
+            const current = await this.owned(tx, owner);
+            return current && current.id === request.memberId && valid() ? counts : null;
+          }
+          if (Object.keys(receipts).length >= 16) return null;
+          // Person row is locked by owned(); the same event cannot move to another inbound turn.
+          if ((await tx`select id from platform.inbound where jsonb_exists(action_receipts,${receiptKey}) limit 1`).length) return null;
+        }
         const batches = await tx`select id from platform.profile_suggestion_batches where app_id=${owner.app}
           and person_id=${owner.personId} and member_id=${member.id} and user_id=${owner.userId}
           and organization_id=${owner.organizationId} and chat_id=${owner.chatId}
@@ -389,13 +435,12 @@ export class ProfileSuggestions {
           where b.app_id=${owner.app} and b.person_id=${owner.personId} and b.member_id=${member.id}
           and b.user_id=${owner.userId} and b.organization_id=${owner.organizationId} and b.chat_id=${owner.chatId}
           and b.created_at<=${new Date(proof.cutoffAt)} and s.connection_id=${request.connectionId}`;
+        const result = { pending: Number(count.pending), retainedAccepted: Number(count.retained_accepted), linkedFacts: Number(count.linked_facts) };
         if (request.operation !== 'readback') await tx`update platform.inbound set action_receipts=jsonb_set(action_receipts,array[${receiptKey}],
-          ${{ state: 'completed', version: 2, operation: request.operation, requestHash: proof.requestSha256,
-            withdrawalId: request.withdrawalId, requestNonce: request.requestNonce,
-            connectionId: request.connectionId, cutoffAt: proof.cutoffAt }}::jsonb) where id=${turnId}`;
+          ${{ ...identity, result }}::jsonb) where id=${turnId}`;
         const after = await this.owned(tx, owner);
         if (!after || after.id !== request.memberId || !valid()) throw denied;
-        return { pending: Number(count.pending), retainedAccepted: Number(count.retained_accepted), linkedFacts: Number(count.linked_facts) };
+        return result;
       });
     } catch (error) { if (error === denied) return null; throw error; }
   }
