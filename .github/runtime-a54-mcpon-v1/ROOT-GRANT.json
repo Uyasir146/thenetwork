@@ -1,0 +1,20 @@
+{
+  "executionApproved": true,
+  "rootReviewed": true,
+  "phase": "hosted-a54-mcp-enabled-retained-image-v1-only",
+  "source": "a54d85c9aca1654ddefaf9313b9f3a9a446fe1ae",
+  "imageConfig": "sha256:0339cf63e35a73a492a1b3795ddad82614c0acff240b442e3b3261f03dcec184",
+  "notBefore": 1792592382.844745,
+  "expiresAt": 1792593501.5603478,
+  "publicSyntheticOnly": true,
+  "ownedGracefulAppTermOncePermitted": true,
+  "ownedPGSmartStopOncePermitted": true,
+  "realKeysPermitted": false,
+  "existingDBPermitted": false,
+  "providerPermitted": false,
+  "OTPOrGrantPermitted": false,
+  "imageRebuildPermitted": false,
+  "pinsSHA256": "b4c91b161b235912e14fa5798ffb453f83632df4a9e6bfb2c8641c3a4ef5b4c7",
+  "rootAdmissionSHA256": "b5eae72359d2a6ecfce8d50c07be9b6f83baed1df00d45c5ff7ac04da9195139",
+  "pathCorrectionSHA256": "1024a96c549110055679b221094c1f99aa35e0b215f2ca3c4b8c3f2747e19162"
+}

@@ -1,11 +1,11 @@
-name: retained EB MCP-on public config qualification
+name: retained a54 MCP-on public config qualification
 on:
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: network-retained-eb4f-mcpon-v2-once
+  group: network-retained-a54-mcpon-v1-once
   cancel-in-progress: false
 jobs:
   runtime:
@@ -19,13 +19,13 @@ jobs:
           persist-credentials: false
       - name: Verify exact reviewed helper bytes
         env:
-          EXPECTED_PINS_SHA256: 5c89182b65d767cb3718895489624acfcaea66a6ef5db730371de4eb2e1c828b
+          EXPECTED_PINS_SHA256: b4c91b161b235912e14fa5798ffb453f83632df4a9e6bfb2c8641c3a4ef5b4c7
         run: |
           python3 - <<'PY'
           from pathlib import Path
           import hashlib,json,os,subprocess
           assert subprocess.check_output(['git','rev-parse','HEAD']).decode().strip()==os.environ['GITHUB_SHA']
-          root=Path('.github/runtime-eb4f-mcpon-v2')
+          root=Path('.github/runtime-a54-mcpon-v1')
           data=(root/'PINS.json').read_bytes()
           assert hashlib.sha256(data).hexdigest()==os.environ['EXPECTED_PINS_SHA256']
           pins=json.loads(data)
@@ -40,14 +40,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh run download 39497416295 --repo eliza-research/thenetwork --name backend-candidate-eb4f543-39497416295-1 --dir .github/runtime-eb4f-mcpon-v2/artifact
+          gh run download 39614220938 --repo eliza-research/thenetwork --name backend-candidate-a54d85c-39614220938-1 --dir .github/runtime-a54-mcpon-v1/artifact
       - name: Qualify actual image once
-        run: python3 .github/runtime-eb4f-mcpon-v2/qualify.py
+        run: python3 .github/runtime-a54-mcpon-v1/qualify.py
       - name: Retain small receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: network-eb4f-mcpon-v2-${{ github.run_id }}-${{ github.run_attempt }}
-          path: .github/runtime-eb4f-mcpon-v2/receipts/
+          name: network-a54-mcpon-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .github/runtime-a54-mcpon-v1/receipts/
           if-no-files-found: error
           retention-days: 7

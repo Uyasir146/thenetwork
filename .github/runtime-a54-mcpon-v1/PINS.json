@@ -1,0 +1,22 @@
+{
+  "qualify.py": {
+    "bytes": 19573,
+    "sha256": "583d315665ba5631b5a312f0af167145bf40ce34e7219429c127b82cbbb7a9c9"
+  },
+  "setup.ts": {
+    "bytes": 3861,
+    "sha256": "bed4dbd360866be1a853acf634d9dc5e07762d32ce0984ad4a27f4a2b8d3b40d"
+  },
+  "probe.ts": {
+    "bytes": 4618,
+    "sha256": "b80cd10d3afc4579786172e70ba7f22c6f18a4c0ee8a7ef69746944fc27bbf8c"
+  },
+  "oci_to_docker.py": {
+    "bytes": 9194,
+    "sha256": "540923c21112e68f58c2b159f31273518d2ad56e46d3b82726b29b0d919a5425"
+  },
+  "EXPECTED-IMAGE.json": {
+    "bytes": 2891,
+    "sha256": "6a517ff71919f6908fbec804b0d35dde142cffb7888582d18a51c8c5fdb6c16f"
+  }
+}
