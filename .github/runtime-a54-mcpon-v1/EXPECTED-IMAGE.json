@@ -1,0 +1,75 @@
+{
+  "archiveBytes": 75390976,
+  "archiveSHA256": "00667c88094549ac7ce7b1b24f6855d362167d0af5a38ed5a5ddb54b32bb0ff3",
+  "manifestDigest": "sha256:36041459e6240c03f04694f6ad68deb1f7f3a8f0f1e5f5fffae9c0185036e344",
+  "configDigest": "sha256:0339cf63e35a73a492a1b3795ddad82614c0acff240b442e3b3261f03dcec184",
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:6310eb16bf4251731feab01e8f633bf5e2d75a657ccad97f420b1f83cce457be",
+      "size": 29792658
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:68118f7307e010844e88d59ee86e6990ae73a396844d67da97ef3627f7495d71",
+      "size": 4186156
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:16e7fb4da3c26d8c4d5f89c329dd3f390b6444c27f60be3885c26293bce7c5e2",
+      "size": 296
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:15b06cb96287ed866730cfff572ae8a9a01c7e33389206e7752b08dc5883d099",
+      "size": 37456727
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:05d1665ddfbafecceb6ba59648b7b82c8c85be12ba83da09240d05938b6a4039",
+      "size": 184
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:47ce961b691020289f5cb2621ee6938c0b92b9b90c863131639c2c6178dc3374",
+      "size": 3402
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:b47b60e8766aff7bd7624aa35f6931c6be5fb2094c0ad3a6691f3cef0e1267b7",
+      "size": 138
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:f772d404ee0865420dcc5a8f72e5f363c4c51c85cbfd4ad75b7812d29b407881",
+      "size": 91
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:a4bf4d4ebbf3a207b32d1b16a366c7b33fe378536f815307b7f1f5346d2122e1",
+      "size": 3930742
+    }
+  ],
+  "diffIDs": [
+    "sha256:411a86676185cb54d695a805b238194a64e9b77e0c723f3802fbb87d333ea0b3",
+    "sha256:cfcf92ea0519d02bdb635c5dc5e7da9be3f6f80b03108b980502ecb377345321",
+    "sha256:f1718a971f018d78fc761d8bfca9c062f9d79d180a698d26c2c2fa739d8fea9e",
+    "sha256:56a7a4ccdb0f2c5f50c8dd8385a27d06c4615d454d31107941ac533c964b4a58",
+    "sha256:b566b5e1e6839883a4684447889c5a394fe8757bb5e7081fff0499bedbfec620",
+    "sha256:4b845e461b5937d4d21f319214265478369209460be17ec7d7e15f7a24977538",
+    "sha256:4c498540652378f11f7fab62f5fc7a0b8dd21834a09788a359993a0620b50dad",
+    "sha256:43cf29e2ac0bd57a839836e92fbe1692122b7a6d61455ce08477c4fa48385691",
+    "sha256:2ac7aab678fbb418ad3c191b1ca2ca8e1d392386c3d33c783e22901305d4a774"
+  ],
+  "rawBytes": [
+    81070080,
+    12030976,
+    3584,
+    79503872,
+    3072,
+    23552,
+    2560,
+    1536,
+    18032128
+  ]
+}
