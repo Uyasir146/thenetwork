@@ -192,17 +192,29 @@ async function v2(operation: "withdraw" | "delete" = "withdraw") {
 	};
 }
 async function snapshot() {
-	return JSON.stringify({
-		batches:
-			await admin`select * from platform.profile_suggestion_batches order by id`,
-		suggestions:
-			await admin`select * from platform.profile_suggestions order by id`,
-		facets: await admin`select * from network.facets order by app_id,id`,
-		receipts:
-			await admin`select * from platform.profile_suggestion_connection_receipts order by request_nonce`,
-		inbound:
-			await admin`select id,action_receipts from platform.inbound order by id`,
-	});
+	// PostgreSQL encodes complete rows and physical REAL bits before the driver
+	// decodes them, so text/binary wire formats cannot change an unchanged snapshot.
+	const [row] = await admin`select jsonb_build_object(
+		'batches', (select coalesce(jsonb_agg(to_jsonb(b) order by b.id), '[]'::jsonb)
+			from platform.profile_suggestion_batches b),
+		'suggestions', (select coalesce(jsonb_agg(to_jsonb(s) order by s.id), '[]'::jsonb)
+			from platform.profile_suggestions s),
+		'facets', (select coalesce(jsonb_agg(to_jsonb(f) order by f.app_id,f.id), '[]'::jsonb)
+			from network.facets f),
+		'receipts', (select coalesce(jsonb_agg(to_jsonb(r) order by r.request_nonce), '[]'::jsonb)
+			from platform.profile_suggestion_connection_receipts r),
+		'inbound', (select coalesce(jsonb_agg(jsonb_build_object('id',i.id,'action_receipts',i.action_receipts)
+			order by i.id), '[]'::jsonb) from platform.inbound i),
+		'confidence_bits', jsonb_build_object(
+			'suggestions', (select coalesce(jsonb_agg(jsonb_build_object('id',s.id,
+				'bits',encode(float4send(s.confidence),'hex')) order by s.id), '[]'::jsonb)
+				from platform.profile_suggestions s),
+			'facets', (select coalesce(jsonb_agg(jsonb_build_object('app_id',f.app_id,'id',f.id,
+				'bits',encode(float4send(f.confidence),'hex')) order by f.app_id,f.id), '[]'::jsonb)
+				from network.facets f)
+		)
+	)::text as snapshot`;
+	return row.snapshot as string;
 }
 
 suite("isolated PostgreSQL completed cleanup reconciliation", () => {
