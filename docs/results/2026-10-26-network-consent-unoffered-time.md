@@ -53,17 +53,17 @@ PASS: 100/100 blocking gates, 8 tracked off target, 126.2s (network 105.7s, slop
 
 ## Rejected implementations
 
-1. **Decide it in `consentOf` instead of `parseProbeReply`.** `consentOf` (`classify.ts:552`) has no access to the offered options, so it cannot tell an unoffered day from an offered one; it would need a new signature on a function used elsewhere, to answer a question only the caller can pose.
+1. **Decide it in `consentOf` instead of `parseProbeReply`.** `consentOf` (`classify.ts:553`) has no access to the offered options, so it cannot tell an unoffered day from an offered one; it would need a new signature on a function used elsewhere, to answer a question only the caller can pose.
 2. **Drop the keys in the caller, `onProbeAnswer` (`network.ts:2300-2316`).** That re-parses member text outside `classify.ts`, leaving `parseProbeReply` still wrong when called directly (as `scripts/sim/evals.ts` and the corpora do), and duplicates the day/clock matching in a second place.
-3. **Thread a miss channel through the shared `mark()` helper.** `mark` is used by every scan in `parseProbeReply` (ordinals, day words, clock times, "any of them", week words), so a miss channel changes behaviour for cases unrelated to this bug.
+3. **Thread a miss channel through the shared `mark()` helper.** `mark` is used by five scans in `parseProbeReply` (option letters, option words, ordinals, day labels, clock labels), so a miss channel changes behaviour for cases unrelated to this bug.
 
 Rejected widening: treating relative days ("tomorrow", "tonight", "this weekend") and "another time" the same way. It fixed those inputs but broke four blocking sim gates (`decliner_exposed: 1`, `consent vs push: meetings (pooled) 144 -> 119`, the sequential-probe gate, and `slop-live: one date at a time`), because `keys: []` takes the "none of those fit" path at `network.ts:2303-2306`. Reverted; those cases stay unchanged from `main` and are follow-ups.
 
 ## Risks and trade-offs
 
-`keys: []` with `why: "counter"` is the same path as "neither" (`classify.ts:724`): `network.ts:2303-2306` appends **all** offered starts to `o.declinedTimes`, pushes `declined_time` into `m.availHistory`, increments `counters.optionsNoneFit`, and the pair is then offered new times. So "Friday works" now records Thursday/Saturday/Sunday as declined for that pair even though the member never refused them. That is intended for "none of those times fit"; for a named-but-unoffered day it is a side effect, disclosed here rather than fixed, because suppressing it means distinguishing those two cases in `onProbeAnswer`, a larger change than this fix.
+`keys: []` with `why: "counter"` is the same path as "neither" (`classify.ts:724`): `network.ts:2303-2306` appends **all** offered starts to `o.declinedTimes`, bumps `optionsNoneFit` (:2304), and pushes a `declined_time` outcome into the member's `m.availHistory` (:2306), increments `counters.optionsNoneFit`, and the pair is then offered new times. So "Friday works" now records Thursday/Saturday/Sunday as declined for that pair even though the member never refused them. That is intended for "none of those times fit"; for a named-but-unoffered day it is a side effect, disclosed here rather than fixed, because suppressing it means distinguishing those two cases in `onProbeAnswer`, a larger change than this fix.
 
-No new `why` value: `counter` already exists (`classify.ts:511`). Refusals, hedges and conditionals are untouched: the guard runs after those branches (`classify.ts:713-715`) and requires `answer === "yes"`.
+No new `why` value: `counter` already exists (`classify.ts:511`). Refusals, hedges and conditionals are untouched: the guard at `classify.ts:729` runs after those early returns (`classify.ts:718-719`) and requires `answer === "yes"`.
 
 ## Follow-ups
 
