@@ -596,9 +596,14 @@ export function consentOf(body: string): Consent {
   if (counter) return { answer: "counter", why: "counter" };
   if (cond) return { answer: "unclear", why: "conditional" };
   if (hedge || question) return { answer: "unclear", why: "hedged" };
-  // A yes needs the shared reader (core parseReply, AGENTS decision 11) not to read a refusal: when the
-  // two disagree the member is asked again, never booked.
-  if (affirmAt < Infinity) return parseReply(body).answer === "no" ? { answer: "unclear", why: "mixed" } : { answer: "yes", why: "affirm" };
+  // A yes needs the shared reader (core parseReply, AGENTS decision 11) not to read a refusal or a
+  // condition: when the two disagree the member is asked again, never booked.
+  if (affirmAt < Infinity) {
+    const shared = parseReply(body);
+    if (shared.answer === "no") return { answer: "unclear", why: "mixed" };
+    if (shared.reason === "conditional_yes") return { answer: "unclear", why: "conditional" };
+    return { answer: "yes", why: "affirm" };
+  }
   return { answer: "unclear", why: "none" };
 }
 
