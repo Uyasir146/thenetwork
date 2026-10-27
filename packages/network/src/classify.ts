@@ -548,10 +548,14 @@ const COND_RX = /\b(?:only if|only with|only when|only for|as long as|so long as
 const COUNTER_RX = /\b(?:different (?:day|time|week)|another (?:day|week)|next week|later (?:in the week|this month|on)|reschedule|instead|rain ?check|some other (?:day|time)|how about|what about|later date|the week after|push it)\b/;
 /** "No problem", "no worries", "no rush", "no plans", "no doubt": not refusals. */
 const HARMLESS_NO = /\bno (?:problem|prob|probs|worries|worry|rush|pressure|biggie|doubt|plans?|stress|sweat|complaints)\b/g;
+/** "I can't say no", "I wouldn't say no (to that)", "I won't say no": a yes that contains "no". */
+const SAY_NO_YES = /\b(?:i\s+)?(?:can'?t|cannot|can not|wouldn'?t|would not|won'?t|will not|don'?t|do not)\s+say no(?:\s+to\s+(?:that|this|it))?\b|\bi(?:'m|m| am) not going to say no\b/g;
+/** "Not a no" and "I'm not saying no" are not refusals and not a clear yes: ask again. */
+const NOT_A_NO = /\b(?:i(?:'m|m| am) not saying no|(?:that'?s|that is|it'?s|it is)\s+not a no|not a no)\b/g;
 
 /** Read a reply as yes, no, a counter-offer or unclear, refusal first and sentence by sentence. */
 export function consentOf(body: string): Consent {
-  const t = normText(body).replace(HARMLESS_NO, " ");
+  const t = normText(body).replace(SAY_NO_YES, " yes ").replace(NOT_A_NO, " ").replace(HARMLESS_NO, " ");
   const wordsIn = (t.match(/[a-z]+/g) ?? []).length;
   let refusalAt = Infinity, affirmAt = Infinity, cond = false, hedge = false, counter = false, question = false;
   for (const s of sentencesOf(t)) {
