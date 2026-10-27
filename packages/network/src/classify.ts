@@ -552,10 +552,12 @@ const HARMLESS_NO = /\bno (?:problem|prob|probs|worries|worry|rush|pressure|bigg
 const SAY_NO_YES = /\b(?:i\s+)?(?:can'?t|cannot|can not|wouldn'?t|would not|won'?t|will not|don'?t|do not)\s+say no(?:\s+to\s+(?:that|this|it))?\b|\bi(?:'m|m| am) not going to say no\b/g;
 /** "Not a no" and "I'm not saying no" are not refusals and not a clear yes: ask again. */
 const NOT_A_NO = /\b(?:i(?:'m|m| am) not saying no|(?:that'?s|that is|it'?s|it is)\s+not a no|not a no)\b/g;
+/** One mask for every reader of a reply: "say no" idioms become a yes, the no-but-ambiguous phrases blank. */
+const maskReply = (body: string) => normText(body).replace(SAY_NO_YES, " yes ").replace(NOT_A_NO, " ").replace(HARMLESS_NO, " ");
 
 /** Read a reply as yes, no, a counter-offer or unclear, refusal first and sentence by sentence. */
 export function consentOf(body: string): Consent {
-  const t = normText(body).replace(SAY_NO_YES, " yes ").replace(NOT_A_NO, " ").replace(HARMLESS_NO, " ");
+  const t = maskReply(body);
   const wordsIn = (t.match(/[a-z]+/g) ?? []).length;
   let refusalAt = Infinity, affirmAt = Infinity, cond = false, hedge = false, counter = false, question = false;
   for (const s of sentencesOf(t)) {
@@ -641,7 +643,8 @@ const POSITIVE_PICK = /\b(works|work for (?:me|us)|does|good|fine|great|perfect|
 function negatedAt(t: string, i: number, len: number): boolean {
   let from = 0;
   for (const m of t.slice(0, i).matchAll(CLAUSE_START)) from = m.index! + m[0].length;
-  return NEG_CUE.test(t.slice(from, i)) || NEG_AFTER.test(t.slice(i + len));
+  // "anything but Thursday" rules Thursday out, though "but" starts a new clause.
+  return /\bany(?:thing|day|time)\s+but\s*$/.test(t.slice(0, i)) || NEG_CUE.test(t.slice(from, i)) || NEG_AFTER.test(t.slice(i + len));
 }
 /** The clause (between punctuation) around position i. */
 function clauseAt(t: string, i: number, len: number): string {
@@ -665,7 +668,7 @@ function clauseAt(t: string, i: number, len: number): string {
  * are "unclear": the member is asked again, never booked.
  */
 export function parseProbeReply(body: string, options: readonly TimeOption[] = []): { answer: "yes" | "no" | "unclear"; keys: string[]; why: ConsentWhy } {
-  const t = normText(body);
+  const t = maskReply(body);
   const c = consentOf(body);
   if (!options.length) return { answer: c.answer === "no" ? "no" : c.answer === "yes" || c.answer === "counter" ? "yes" : "unclear", keys: [], why: c.why };
   const all = options.map(o => o.key);

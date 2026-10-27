@@ -332,3 +332,9 @@
 {"text":"not a no","label":"unclear"}
 {"text":"That's not a no","label":"unclear"}
 {"text":"I'm not saying no","label":"unclear"}
+{"text":"I can't say no to Thursday","label":"yes","keys":["a"]}
+{"text":"I wouldn't say no to Sunday","label":"yes","keys":["c"]}
+{"text":"I won't say no to Saturday 11am","label":"yes","keys":["b"]}
+{"text":"I can't say no to option b","label":"yes","keys":["b"]}
+{"text":"I can't say no to anything but Thursday","label":"yes","keys":["b","c"]}
+{"text":"I'm not going to say no to Thursday","label":"yes","keys":["a"]}

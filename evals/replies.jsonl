@@ -194,3 +194,7 @@
 {"text":"not a no","label":"unsure"}
 {"text":"That's not a no","label":"unsure"}
 {"text":"I'm not saying no","label":"unsure"}
+{"text":"I can't say no to Thursday","label":"yes"}
+{"text":"I wouldn't say no to Sunday","label":"yes"}
+{"text":"I can't say no to anything but Thursday","label":"yes"}
+{"text":"I'm not going to say no to Thursday","label":"yes"}
