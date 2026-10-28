@@ -690,8 +690,9 @@ export function parseProbeReply(body: string, options: readonly TimeOption[] = [
   ];
   for (const [re, i] of ordinals) if (options[i]) for (const m of t.matchAll(re)) mark([options[i]!.key], m.index!, m[0].length);
   // A day or clock time the member names that no option offers ("Friday works" against Thursday,
-  // Saturday and Sunday): the reply is a yes with no pick, so the probe asks again for other times
-  // and never books a time the member did not name (network-consent: record the time they accept).
+  // Saturday and Sunday): the reply names no offered option, so it must never fall through to the
+  // plain-yes branch below and book every option the member did not refuse
+  // (network-consent: record the time they accept).
   let unoffered = false;
   for (const [re, dayName] of DAY_WORDS) {
     const keys = options.filter(o => o.label.startsWith(dayName)).map(o => o.key);
@@ -724,9 +725,11 @@ export function parseProbeReply(body: string, options: readonly TimeOption[] = [
   // "Any of them" (not refused, not a request for other days): every option the member did not rule out.
   const allAt = ALL.exec(t) ?? ALL_WEAK.exec(t);
   if (allAt && c.answer !== "counter" && !negatedAt(t, allAt.index, allAt[0].length)) return open.length ? { answer: "yes", keys: open, why: c.why } : unclear;
-  // A yes that names a day or time we did not offer shares nothing with the options: no pick, and the
-  // 'counter' reason the flow reads as "none of those times fit" (it offers new times, never books).
-  if (c.answer === "yes" && unoffered) return { answer: "yes", keys: [], why: "counter" };
+  // A yes that names a day or time we did not offer shares nothing with the options: it is not a pick, and
+  // it is not "none of those fit" either, so it books nothing and records nothing as refused. unclear
+  // returns before onProbeAnswer (network.ts), so no declinedTimes, no availability history and no
+  // optionsNoneFit bump: the probe asks again for other times instead of writing off times nobody refused.
+  if (c.answer === "yes" && unoffered) return { answer: "unclear", keys: [], why: "none" };
   if (c.answer === "yes") return { answer: "yes", keys: open, why: c.why };
   if (c.answer === "counter") return { answer: "yes", keys: [], why: c.why };
   // Only refusals ("Thursday doesn't work") are not a yes: the probe stays open for a clear answer.

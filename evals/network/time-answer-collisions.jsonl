@@ -1,0 +1,2 @@
+{"text":"Friday works","options":["Thursday 7pm","Saturday 11am","Sunday 2pm"],"answer":"unclear","keys":[]}
+{"text":"Saturday 11am works","options":["Thursday 7pm","Saturday 11am","Sunday 2pm"],"answer":"yes","keys":["b"]}
