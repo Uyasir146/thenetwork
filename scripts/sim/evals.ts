@@ -77,6 +77,17 @@ export async function evalsBlock(b: Block): Promise<void> {
   }
   b.gate(`time answers: a day or time nobody offered is never a pick (n ${collisions.length}, exact match)`, collisions.length >= 2 && wrongCollision.length === 0, wrongCollision.slice(0, 3).join(" | ") || `${collisions.length}/${collisions.length} exact`);
 
+  // A time the probe never offered must not be recorded as every offered time. Exact match on the
+  // answer and the full key list, zero misses: a count-weighted accuracy gate absorbs one row.
+  const unoffered = await jsonl<{ text: string; answer: "yes" | "unclear" | "no"; keys?: string[]; options: { key: string; label: string }[] }>("network/unoffered-time-answers.jsonl");
+  const unofferedMisses: string[] = [];
+  for (const row of unoffered) {
+    const options = row.options.map((o, i) => ({ key: o.key, label: o.label, start: i * 2 + 1, end: i * 2 + 2 }));
+    const r = parseProbeReply(row.text, options);
+    if (r.answer !== row.answer || JSON.stringify(r.keys) !== JSON.stringify(row.keys ?? [])) unofferedMisses.push(`${row.text} -> ${r.answer} [${r.keys}]`);
+  }
+  b.gate(`unoffered times: a named time we did not offer books nothing (n ${unoffered.length})`, unoffered.length >= 8 && unofferedMisses.length === 0, unofferedMisses.slice(0, 5).join(" | "));
+
   const benign = (await Bun.file(`${ROOT}/network/benign-adult.txt`).text()).trim().split("\n");
   const flagged = benign.filter(t => classify(t).abuse.length);
   b.gate(`benign adult phrasing: precision >= 99% (n ${benign.length})`, benign.length >= 200 && 1 - flagged.length / benign.length >= 0.99, pct(1 - flagged.length / benign.length));

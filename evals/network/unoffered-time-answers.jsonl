@@ -1,0 +1,8 @@
+{"text": "Friday works", "answer": "unclear", "options": [{"key": "a", "label": "Thursday 7pm"}, {"key": "b", "label": "Saturday 11am"}, {"key": "c", "label": "Sunday 2pm"}]}
+{"text": "friday works for me", "answer": "unclear", "options": [{"key": "a", "label": "Thursday 7pm"}, {"key": "b", "label": "Saturday 11am"}, {"key": "c", "label": "Sunday 2pm"}]}
+{"text": "9pm works", "answer": "unclear", "options": [{"key": "a", "label": "Thursday 7pm"}, {"key": "b", "label": "Saturday 11am"}, {"key": "c", "label": "Sunday 2pm"}]}
+{"text": "8:30am works for me", "answer": "unclear", "options": [{"key": "a", "label": "Thursday 7pm"}, {"key": "b", "label": "Saturday 11am"}, {"key": "c", "label": "Sunday 2pm"}]}
+{"text": "Friday works, not Thursday", "answer": "unclear", "options": [{"key": "a", "label": "Thursday 7pm"}, {"key": "b", "label": "Saturday 11am"}, {"key": "c", "label": "Sunday 2pm"}]}
+{"text": "can we do friday instead", "answer": "yes", "keys": [], "options": [{"key": "a", "label": "Thursday 7pm"}, {"key": "b", "label": "Saturday 11am"}, {"key": "c", "label": "Sunday 2pm"}]}
+{"text": "Thursday works", "answer": "yes", "keys": ["a"], "options": [{"key": "a", "label": "Thursday 7pm"}, {"key": "b", "label": "Saturday 11am"}, {"key": "c", "label": "Sunday 2pm"}]}
+{"text": "thursday or sunday works", "answer": "yes", "keys": ["a", "c"], "options": [{"key": "a", "label": "Thursday 7pm"}, {"key": "b", "label": "Saturday 11am"}, {"key": "c", "label": "Sunday 2pm"}]}
